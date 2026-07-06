@@ -1,5 +1,6 @@
 ---
 source: tui/tests/snapshots.rs
+assertion_line: 115
 expression: "render_bottom_pane_snapshot(&state, 80, 4)"
 ---
                                                                                 › Ask cusa to do anything                                                                                                                                         auto · suggest · /tmp/repo

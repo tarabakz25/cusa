@@ -1002,7 +1002,7 @@ mod tests {
         assert!(s.contains("cusa"), "welcome header missing: {s:?}");
         assert!(s.contains("/tmp/repo"), "directory missing: {s:?}");
         assert!(s.contains("model:"), "session card missing: {s:?}");
-        assert!(s.contains("Type your message"), "composer placeholder missing: {s:?}");
+        assert!(s.contains("Ask cusa"), "composer placeholder missing: {s:?}");
         assert!(s.contains("suggest"), "composer footer mode missing: {s:?}");
     }
 

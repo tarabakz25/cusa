@@ -5,6 +5,8 @@
 // Tests continue to use `ratatui::Terminal` + `TestBackend` for snapshots.
 
 use crate::codex_ui::custom_terminal;
+use crate::codex_ui::terminal_palette::set_default_colors_from_startup_probe;
+use crate::codex_adapter::terminal_probe;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -24,6 +26,8 @@ impl TerminalSession {
     /// Enter raw mode + alternate screen and construct a full-screen viewport.
     pub fn open() -> io::Result<Self> {
         enable_raw_mode()?;
+        let colors = terminal_probe::default_colors(terminal_probe::DEFAULT_TIMEOUT).ok().flatten();
+        set_default_colors_from_startup_probe(colors);
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);

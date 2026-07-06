@@ -7,16 +7,20 @@ use crate::app::state::AppState;
 use crate::codex_ui::keymap::{composer_submit_keys, RuntimeKeymap};
 use crate::codex_adapter::types::ComposerView;
 use crate::codex_adapter::view_model::CusaViewModel;
-use crate::codex_ui::bottom_pane::textarea::TextArea;
+use crate::codex_ui::bottom_pane::textarea::{TextArea, TextAreaState};
 use crate::codex_ui::key_hint::KeyBindingListExt;
+use crate::codex_ui::render::{Insets, RectExt};
 use crate::codex_ui::style::user_message_style;
 use crate::codex_ui::ui_consts::LIVE_PREFIX_COLS;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Margin, Rect};
 use ratatui::style::Stylize;
-use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Widget, WidgetRef};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, StatefulWidgetRef, Widget, WidgetRef};
+
+/// Codex default placeholder (`Ask Codex to do anything` → cusa branding).
+pub const COMPOSER_PLACEHOLDER: &str = "Ask cusa to do anything";
 
 /// Result of feeding a key into the composer while the input pane is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,39 +51,31 @@ impl ComposerWidget {
         }
     }
 
-    /// Rows required for the composer region (top border + wrapped textarea).
+    /// Rows for the tinted composer surface (padding only — footer is separate).
     pub fn desired_height(text: &str, width: u16) -> u16 {
         let inner_width = inner_text_width(width);
         let mut textarea = TextArea::new();
         textarea.set_text_clearing_elements(text);
-        (textarea.desired_height(inner_width) + 1).max(2)
+        textarea.desired_height(inner_width).saturating_add(2).max(3)
     }
 
     pub fn desired_height_for_state(state: &AppState, width: u16) -> u16 {
         Self::desired_height(&state.input, width)
     }
-}
 
-impl Widget for ComposerWidget {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let style = user_message_style();
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(style);
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        if inner.is_empty() {
+    /// Render the Codex `ChatComposer` tinted input surface (no top rule).
+    pub fn render_composer_surface(&self, area: Rect, buf: &mut Buffer) {
+        if area.is_empty() {
             return;
         }
 
-        let textarea_width = inner_text_width(inner.width);
-        let textarea_rect = Rect {
-            x: inner.x,
-            y: inner.y,
-            width: textarea_width.min(inner.width),
-            height: inner.height,
-        };
+        let style = user_message_style();
+        Block::default().style(style).render_ref(area, buf);
+
+        let textarea_rect = area.inset(Insets::tlbr(1, LIVE_PREFIX_COLS, 1, 1));
+        if textarea_rect.is_empty() {
+            return;
+        }
 
         let mut textarea = TextArea::new();
         textarea.set_text_clearing_elements(&self.buffer);
@@ -90,24 +86,31 @@ impl Widget for ComposerWidget {
         } else {
             Span::from("›").dim()
         };
-        if textarea_rect.width > 0 {
-            buf.set_span(
-                textarea_rect.x.saturating_sub(LIVE_PREFIX_COLS),
-                textarea_rect.y,
-                &prompt,
-                textarea_rect.width.saturating_add(LIVE_PREFIX_COLS),
+        buf.set_span(
+            textarea_rect.x.saturating_sub(LIVE_PREFIX_COLS),
+            textarea_rect.y,
+            &prompt,
+            textarea_rect.width.saturating_add(LIVE_PREFIX_COLS),
+        );
+
+        let mut state = TextAreaState::default();
+        if self.active {
+            StatefulWidgetRef::render_ref(&(&textarea), textarea_rect, buf, &mut state);
+        }
+
+        if self.active && self.buffer.is_empty() {
+            let placeholder = Span::from(COMPOSER_PLACEHOLDER).dim();
+            Line::from(vec![placeholder]).render_ref(
+                textarea_rect.inner(Margin::new(0, 0)),
+                buf,
             );
         }
+    }
+}
 
-        if self.buffer.is_empty() && self.active {
-            let placeholder = Span::from("Type your message...").dim();
-            let ph_x = textarea_rect.x.saturating_add(1);
-            if textarea_rect.width > 1 {
-                buf.set_span(ph_x, textarea_rect.y, &placeholder, textarea_rect.width - 1);
-            }
-        }
-
-        (&textarea).render_ref(textarea_rect, buf);
+impl Widget for ComposerWidget {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.render_composer_surface(area, buf);
     }
 }
 
@@ -203,13 +206,13 @@ mod tests {
     }
 
     #[test]
-    fn spec_106_composer_widget_renders_codex_prefix() {
+    fn spec_106_composer_widget_renders_codex_prefix_and_placeholder() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let state = AppState::new("/tmp".into());
         let widget = ComposerWidget::from_state(&state);
-        let backend = TestBackend::new(80, 3);
+        let backend = TestBackend::new(80, 4);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
@@ -224,5 +227,9 @@ mod tests {
             .map(|c| c.symbol().to_string())
             .collect();
         assert!(content.contains('›'), "composer prefix missing: {content:?}");
+        assert!(
+            content.contains(COMPOSER_PLACEHOLDER),
+            "placeholder missing: {content:?}"
+        );
     }
 }

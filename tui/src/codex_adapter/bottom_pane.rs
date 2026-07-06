@@ -1,18 +1,19 @@
 // Copyright 2026 cusa contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Codex-style bottom pane: multi-line composer + inline status row beneath.
+// Codex-style bottom pane: tinted composer + status row (ChatComposer layout).
 
 use crate::app::state::AppState;
 use crate::codex_adapter::composer::ComposerWidget;
 use crate::codex_adapter::welcome::composer_footer_line;
+use crate::codex_ui::ui_consts::FOOTER_INDENT_COLS;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::widgets::{Paragraph, Widget};
 
-const COMPOSER_STATUS_HEIGHT: u16 = 1;
+const FOOTER_ROW_HEIGHT: u16 = 1;
 
-/// Bottom pane matching Codex layout: composer on top, model/cwd status below.
+/// Bottom pane matching Codex `ChatComposer` + footer status row.
 #[derive(Debug, Clone)]
 pub struct BottomPaneWidget {
     composer: ComposerWidget,
@@ -28,25 +29,33 @@ impl BottomPaneWidget {
     }
 
     pub fn desired_height(state: &AppState, width: u16) -> u16 {
-        ComposerWidget::desired_height_for_state(state, width) + COMPOSER_STATUS_HEIGHT
+        ComposerWidget::desired_height_for_state(state, width) + FOOTER_ROW_HEIGHT
     }
 }
 
 impl Widget for BottomPaneWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
+        if area.is_empty() {
             return;
         }
-        let chunks = Layout::default()
+        let [composer_rect, footer_rect] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
-                Constraint::Length(COMPOSER_STATUS_HEIGHT.min(area.height)),
+                Constraint::Length(FOOTER_ROW_HEIGHT.min(area.height)),
             ])
-            .split(area);
-        self.composer.render(chunks[0], buf);
-        if chunks[1].height > 0 {
-            Paragraph::new(self.footer).render(chunks[1], buf);
+            .areas(area);
+
+        self.composer.render_composer_surface(composer_rect, buf);
+
+        if footer_rect.height > 0 && footer_rect.width > FOOTER_INDENT_COLS as u16 {
+            let indented = Rect {
+                x: footer_rect.x.saturating_add(FOOTER_INDENT_COLS as u16),
+                y: footer_rect.y,
+                width: footer_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16),
+                height: footer_rect.height,
+            };
+            Paragraph::new(self.footer).render(indented, buf);
         }
     }
 }
