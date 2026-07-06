@@ -52,6 +52,9 @@ pub struct TurnState {
     /// Sidecar-assigned run id captured from `router/decision`. Used by
     /// `session/cancel` to target the correct run (SPEC-004).
     pub run_id: Option<String>,
+    /// Wall-clock start of this turn. Drives the activity indicator's
+    /// elapsed-seconds readout and spinner animation (SPEC-001/004).
+    pub started_at: Option<std::time::Instant>,
 }
 
 impl TurnState {
@@ -61,6 +64,7 @@ impl TurnState {
             assistant_text: String::new(),
             model: None,
             run_id: None,
+            started_at: Some(std::time::Instant::now()),
         }
     }
 }

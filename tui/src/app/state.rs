@@ -192,6 +192,11 @@ pub struct AppState {
     /// composition before text is committed). Hides the placeholder so preedit
     /// does not overlap the dim hint string.
     pub composer_input_active: bool,
+    /// SPEC-002: selected row in the slash-command suggestion popup.
+    pub slash_popup_selected: usize,
+    /// SPEC-002: true when the user dismissed the popup with Esc for the
+    /// current input. Re-armed on the next edit.
+    pub slash_popup_dismissed: bool,
 }
 
 impl AppState {
@@ -228,6 +233,21 @@ impl AppState {
             history_nav: None,
             context_strategy: ContextStrategy::Auto,
             composer_input_active: false,
+            slash_popup_selected: 0,
+            slash_popup_dismissed: false,
+        }
+    }
+
+    /// SPEC-002: suggestions for the composer's slash-command popup, or an
+    /// empty vec when the popup is hidden (non-slash input, Esc-dismissed,
+    /// or an overlay is open).
+    pub fn slash_suggestions(&self) -> Vec<crate::app::slash::CommandHint> {
+        if self.slash_popup_dismissed || self.overlay.is_open() {
+            return Vec::new();
+        }
+        match crate::app::slash::popup_prefix(&self.input) {
+            Some(prefix) => crate::app::slash::suggestions(prefix),
+            None => Vec::new(),
         }
     }
 
@@ -462,5 +482,15 @@ mod tests {
             .iter()
             .any(|e| matches!(e, TranscriptEntry::TurnSummary { .. }));
         assert!(has_summary, "expected a turn summary in transcript");
+    }
+
+    #[test]
+    fn spec_001_begin_user_turn_records_start_time() {
+        let mut s = AppState::new("/x".into());
+        s.begin_user_turn("hi".into());
+        assert!(
+            s.current_turn.as_ref().unwrap().started_at.is_some(),
+            "started_at drives the activity indicator's elapsed readout"
+        );
     }
 }
