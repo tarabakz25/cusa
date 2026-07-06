@@ -29,7 +29,7 @@ impl<'a> FooterWidget<'a> {
         }
         let hint = match self.state.phase {
             RunPhase::Idle => "Enter send · /help commands · Ctrl-C exit",
-            RunPhase::Streaming | RunPhase::Routing => "Ctrl-C cancel · streaming…",
+            RunPhase::Streaming | RunPhase::Sending => "Ctrl-C cancel · streaming…",
             RunPhase::AwaitingApproval => "y approve · n deny · a always",
             RunPhase::Cancelling => "cancelling…",
         };

@@ -114,7 +114,7 @@ impl CusaViewModel {
 fn map_run_phase(phase: RunPhase) -> RunPhaseView {
     match phase {
         RunPhase::Idle => RunPhaseView::Idle,
-        RunPhase::Routing => RunPhaseView::Routing,
+        RunPhase::Sending => RunPhaseView::Sending,
         RunPhase::Streaming => RunPhaseView::Streaming,
         RunPhase::AwaitingApproval => RunPhaseView::AwaitingApproval,
         RunPhase::Cancelling => RunPhaseView::Cancelling,
@@ -171,7 +171,7 @@ mod tests {
         assert!(view.active);
         assert!(!view.multiline);
         assert!(!view.history_nav_active);
-        assert_eq!(view.phase, RunPhaseView::Routing);
+        assert_eq!(view.phase, RunPhaseView::Sending);
     }
 
     #[test]

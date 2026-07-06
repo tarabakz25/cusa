@@ -13,7 +13,7 @@ interface Emitted {
   params: unknown;
 }
 
-function newHarness(opts?: { apiKey?: string | null }) {
+function newHarness(opts?: { apiKey?: string | null; sendTimeoutMs?: number }) {
   const emitted: Emitted[] = [];
   const notify = (method: string, params: unknown) =>
     emitted.push({ method, params });
@@ -25,6 +25,9 @@ function newHarness(opts?: { apiKey?: string | null }) {
       opts?.apiKey === null
         ? null
         : { key: opts?.apiKey ?? "sk_test", origin: "env" },
+    ...(opts?.sendTimeoutMs === undefined
+      ? {}
+      : { sendTimeoutMs: opts.sendTimeoutMs }),
   });
   return { adapter, mgr, emitted };
 }
@@ -422,4 +425,59 @@ test("SPEC-024: full-auto skips tool/approvalRequest for write tools", async () 
     emitted.filter((e) => e.method === "tool/approvalRequest").length,
     0,
   );
+});
+
+// ----------------------------------------------------------------------
+// issue #5: agent.send() timeout
+// ----------------------------------------------------------------------
+
+test("issue #5: session/send rejects with AGENT_ERROR when agent.send() never resolves", async () => {
+  const { mgr, adapter } = newHarness({ sendTimeoutMs: 25 });
+  const create = await mgr.createSession({ cwd: "/tmp/repo" });
+  adapter.hangNextSend = true;
+  await assert.rejects(
+    async () => {
+      await mgr.sendMessage({ sessionId: create.sessionId, text: "hello" });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof SessionRpcError);
+      assert.equal((err as SessionRpcError).code, RpcErrorCode.AgentError);
+      assert.match((err as SessionRpcError).message, /timed out after 25 ms/);
+      return true;
+    },
+  );
+});
+
+test("issue #5: a timed-out send does not wedge the session — the next send succeeds", async () => {
+  const { mgr, adapter, emitted } = newHarness({ sendTimeoutMs: 25 });
+  const create = await mgr.createSession({ cwd: "/tmp/repo" });
+  adapter.hangNextSend = true;
+  await assert.rejects(async () => {
+    await mgr.sendMessage({ sessionId: create.sessionId, text: "first" });
+  });
+  adapter.script({
+    events: [{ kind: "text-delta", delta: "ok", textKind: "assistant" }],
+    result: { status: "finished" },
+  });
+  const send = await mgr.sendMessage({
+    sessionId: create.sessionId,
+    text: "second",
+  });
+  assert.ok(send.runId);
+  await until(() => emitted.some((e) => e.method === "run/finished"));
+});
+
+test("issue #5: a send that resolves within the budget is unaffected by the timer", async () => {
+  const { mgr, adapter, emitted } = newHarness({ sendTimeoutMs: 5_000 });
+  const create = await mgr.createSession({ cwd: "/tmp/repo" });
+  adapter.script({
+    events: [{ kind: "text-delta", delta: "hi", textKind: "assistant" }],
+    result: { status: "finished" },
+  });
+  const send = await mgr.sendMessage({
+    sessionId: create.sessionId,
+    text: "quick",
+  });
+  assert.ok(send.runId);
+  await until(() => emitted.some((e) => e.method === "run/finished"));
 });

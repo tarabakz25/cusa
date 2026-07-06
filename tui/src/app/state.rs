@@ -23,8 +23,10 @@ pub const HISTORY_CAP: usize = 200;
 pub enum RunPhase {
     /// No run in flight.
     Idle,
-    /// User submitted; awaiting router decision.
-    Routing,
+    /// User submitted; `session/send` in flight. Covers routing (near-zero
+    /// cost) *and* the network round-trip that establishes the run with the
+    /// Cursor API — which is where the real waiting happens (issue #5).
+    Sending,
     /// Streaming assistant output.
     Streaming,
     /// A tool call is awaiting user approval.
@@ -37,7 +39,7 @@ impl RunPhase {
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            RunPhase::Routing | RunPhase::Streaming | RunPhase::AwaitingApproval
+            RunPhase::Sending | RunPhase::Streaming | RunPhase::AwaitingApproval
         )
     }
 
@@ -45,7 +47,7 @@ impl RunPhase {
     pub fn label(self) -> &'static str {
         match self {
             RunPhase::Idle => "idle",
-            RunPhase::Routing => "routing",
+            RunPhase::Sending => "sending",
             RunPhase::Streaming => "streaming",
             RunPhase::AwaitingApproval => "awaiting approval",
             RunPhase::Cancelling => "cancelling",
@@ -283,7 +285,7 @@ impl AppState {
         self.transcript
             .push(TranscriptEntry::User(prompt.clone()));
         self.current_turn = Some(TurnState::new(prompt));
-        self.phase = RunPhase::Routing;
+        self.phase = RunPhase::Sending;
     }
 
     /// Called when `router/decision` arrives. Captures the sidecar-assigned
@@ -306,7 +308,7 @@ impl AppState {
             rationale,
             source,
         });
-        if self.phase == RunPhase::Routing {
+        if self.phase == RunPhase::Sending {
             self.phase = RunPhase::Streaming;
         }
     }
@@ -345,6 +347,27 @@ impl AppState {
             });
         }
         self.phase = RunPhase::Idle;
+    }
+
+    /// Called when the `session/send` RPC itself fails (error response,
+    /// transport loss, or client-side timeout). The sidecar never emits
+    /// `run/error` in this case — the run was never established — so the
+    /// TUI surfaces the failure and unlocks the composer itself (issue #5).
+    ///
+    /// If a run WAS already established (`run_id` present on the current
+    /// turn), the error is only logged to the transcript: run settlement
+    /// stays driven by `run/finished` / `run/error` notifications.
+    pub fn on_send_failed(&mut self, message: String) {
+        self.transcript.push(TranscriptEntry::Error(message));
+        let run_established = self
+            .current_turn
+            .as_ref()
+            .and_then(|t| t.run_id.as_ref())
+            .is_some();
+        if !run_established {
+            self.current_turn = None;
+            self.phase = RunPhase::Idle;
+        }
     }
 
     /// Called on `run/error`.
@@ -492,5 +515,47 @@ mod tests {
             s.current_turn.as_ref().unwrap().started_at.is_some(),
             "started_at drives the activity indicator's elapsed readout"
         );
+    }
+
+    // ----- issue #5: session/send failure handling ------------------------
+
+    #[test]
+    fn issue_5_send_failed_before_run_established_returns_to_idle() {
+        let mut s = AppState::new("/x".into());
+        s.begin_user_turn("hi".into());
+        assert_eq!(s.phase, RunPhase::Sending);
+
+        s.on_send_failed("session/send failed: NO_API_KEY".into());
+
+        assert_eq!(s.phase, RunPhase::Idle, "composer must unlock");
+        assert!(s.current_turn.is_none(), "orphaned turn must be dropped");
+        let has_error = s.transcript.iter().any(|e| {
+            matches!(e, TranscriptEntry::Error(msg) if msg.contains("NO_API_KEY"))
+        });
+        assert!(has_error, "the failure must be visible in the transcript");
+    }
+
+    #[test]
+    fn issue_5_send_failed_after_run_established_only_logs() {
+        let mut s = AppState::new("/x".into());
+        s.begin_user_turn("hi".into());
+        s.on_router_decision(
+            "composer-2.5".into(),
+            "rule".into(),
+            "run-1".into(),
+            RouterSource::Rule,
+        );
+        assert_eq!(s.phase, RunPhase::Streaming);
+
+        s.on_send_failed("late transport error".into());
+
+        // Run settlement stays owned by run/finished / run/error.
+        assert_eq!(s.phase, RunPhase::Streaming);
+        assert!(s.current_turn.is_some());
+        let has_error = s
+            .transcript
+            .iter()
+            .any(|e| matches!(e, TranscriptEntry::Error(msg) if msg.contains("late transport")));
+        assert!(has_error);
     }
 }

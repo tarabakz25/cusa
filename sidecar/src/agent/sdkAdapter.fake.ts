@@ -79,6 +79,13 @@ export class FakeSdkAdapter implements SdkAdapter {
    */
   scripts: TurnScript[] = [];
 
+  /**
+   * When true, the next `send()` call never resolves on its own — it only
+   * settles (with a rejection) once the caller aborts `SendOptions.signal`.
+   * Used to exercise the session-level send timeout (issue #5).
+   */
+  hangNextSend = false;
+
   script(...s: TurnScript[]): void {
     this.scripts.push(...s);
   }
@@ -128,6 +135,18 @@ class FakeAgentHandle implements AgentHandle {
         ? {}
         : { mcpServers: opts.mcpServers }),
     });
+    if (this.adapter.hangNextSend) {
+      this.adapter.hangNextSend = false;
+      return new Promise<TurnHandle>((_, reject) => {
+        const abort = () =>
+          reject(new Error("fake send aborted via SendOptions.signal"));
+        if (opts.signal?.aborted) {
+          abort();
+          return;
+        }
+        opts.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
     const script = this.adapter.scripts.shift() ?? {
       events: [],
       result: { status: "finished" },
