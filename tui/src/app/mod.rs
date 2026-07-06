@@ -1749,6 +1749,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spec_002_popup_new_alias_suggests_completes_and_runs_clear() {
+        // Typing `/ne` surfaces /clear via its `new` alias; Tab completes
+        // to the canonical `/clear`.
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        for c in ['/', 'n', 'e'] {
+            handle_key(&mut state, &client, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        let names: Vec<&str> = state.slash_suggestions().iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["clear"], "typing /ne must suggest /clear");
+        handle_key(&mut state, &client, KeyCode::Tab, KeyModifiers::empty());
+        assert_eq!(state.input, "/clear", "Tab completes the canonical name");
+
+        // Typing `/new` + Enter runs /clear end-to-end.
+        let mut run = AppState::new("/tmp".into());
+        run.session.session_id = Some("keep-me".into());
+        run.transcript.push(TranscriptEntry::User("gone".into()));
+        for c in ['/', 'n', 'e', 'w'] {
+            handle_key(&mut run, &client, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        handle_key(&mut run, &client, KeyCode::Enter, KeyModifiers::empty());
+        assert!(run.transcript.is_empty(), "/new must clear the transcript");
+        assert_eq!(run.session.session_id.as_deref(), Some("keep-me"));
+        assert!(run.input.is_empty(), "buffer cleared after dispatch");
+    }
+
+    #[tokio::test]
+    async fn spec_002_new_alias_runs_clear_even_with_popup_dismissed() {
+        // Esc hides the popup; a manually-typed `/new` must still parse
+        // through the plain submit path.
+        let mut state = AppState::new("/tmp".into());
+        state.transcript.push(TranscriptEntry::User("gone".into()));
+        let (client, _peer) = SidecarClient::in_memory();
+        for c in ['/', 'n', 'e', 'w'] {
+            handle_key(&mut state, &client, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        handle_key(&mut state, &client, KeyCode::Esc, KeyModifiers::empty());
+        assert!(state.slash_suggestions().is_empty(), "popup dismissed");
+        handle_key(&mut state, &client, KeyCode::Enter, KeyModifiers::empty());
+        assert!(state.transcript.is_empty(), "/new must clear via submit path");
+    }
+
+    #[tokio::test]
     async fn spec_002_popup_esc_dismisses_and_edit_rearms() {
         let mut state = AppState::new("/tmp".into());
         let (client, _peer) = SidecarClient::in_memory();

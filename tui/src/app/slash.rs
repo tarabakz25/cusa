@@ -103,7 +103,7 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
     let opt_arg = if args.is_empty() { None } else { Some(args.clone()) };
     let cmd = match name.to_ascii_lowercase().as_str() {
         "help" | "?" => SlashCommand::Help,
-        "clear" => SlashCommand::Clear,
+        "clear" | "new" => SlashCommand::Clear,
         "reset" => SlashCommand::Reset,
         "quit" | "exit" => SlashCommand::Quit,
         "model" => SlashCommand::Model(opt_arg),
@@ -147,7 +147,7 @@ fn parse_context_arg(args: &str) -> Option<String> {
 pub fn help_entries() -> &'static [(&'static str, &'static str)] {
     &[
         ("/help", "Show this list."),
-        ("/clear", "Clear the transcript, keep the session."),
+        ("/clear (/new)", "Clear the transcript, keep the session."),
         ("/reset", "Dispose the current session and start fresh."),
         ("/quit", "Exit cusa."),
         ("/model <id|auto>", "Set the model for subsequent turns."),
@@ -168,27 +168,55 @@ pub fn help_entries() -> &'static [(&'static str, &'static str)] {
 pub struct CommandHint {
     /// Canonical command name, without the leading slash.
     pub name: &'static str,
+    /// Alternate names accepted by `parse` and matched by the popup's
+    /// prefix filter (e.g. `/new` for `/clear`). Kept in sync with the
+    /// alias arms in `parse` — see
+    /// `spec_002_every_suggestion_parses_to_a_known_command`.
+    pub aliases: &'static [&'static str],
     /// One-line description rendered next to the name.
     pub description: &'static str,
     /// True when the command accepts an argument tail.
     pub takes_args: bool,
 }
 
+impl CommandHint {
+    /// Popup display label, without the leading slash: the canonical name
+    /// plus any aliases — `clear (new)`. Tab/Enter always complete to the
+    /// canonical `name`; the label is display-only.
+    pub fn label(&self) -> String {
+        if self.aliases.is_empty() {
+            self.name.to_string()
+        } else {
+            format!("{} ({})", self.name, self.aliases.join(", "))
+        }
+    }
+
+    /// True when `candidate` prefix-matches the canonical name or any alias.
+    fn matches_prefix(&self, candidate: &str) -> bool {
+        self.name.starts_with(candidate) || self.aliases.iter().any(|a| a.starts_with(candidate))
+    }
+
+    /// True when `candidate` equals the canonical name or any alias.
+    fn matches_exact(&self, candidate: &str) -> bool {
+        self.name == candidate || self.aliases.contains(&candidate)
+    }
+}
+
 /// Commands offered by the suggestion popup, in display order. Kept in sync
 /// with `parse` — see `spec_002_every_suggestion_parses_to_a_known_command`.
 const SUGGESTABLE: &[CommandHint] = &[
-    CommandHint { name: "help", description: "Show the command list.", takes_args: false },
-    CommandHint { name: "clear", description: "Clear the transcript, keep the session.", takes_args: false },
-    CommandHint { name: "reset", description: "Dispose the current session and start fresh.", takes_args: false },
-    CommandHint { name: "quit", description: "Exit cusa.", takes_args: false },
-    CommandHint { name: "model", description: "Pick a model or set one (<id|auto>).", takes_args: true },
-    CommandHint { name: "mode", description: "Change approval mode (alias for /approval).", takes_args: true },
-    CommandHint { name: "approval", description: "Cycle or pick the approval mode.", takes_args: true },
-    CommandHint { name: "skills", description: "Toggle skill injection.", takes_args: false },
-    CommandHint { name: "mcp", description: "Inspect / toggle MCP servers.", takes_args: false },
-    CommandHint { name: "cost", description: "Show per-turn cost + per-model aggregates.", takes_args: false },
-    CommandHint { name: "resume", description: "Resume a prior session.", takes_args: true },
-    CommandHint { name: "context", description: "Force history strategy (strategy=<auto|raw|summary>).", takes_args: true },
+    CommandHint { name: "help", aliases: &[], description: "Show the command list.", takes_args: false },
+    CommandHint { name: "clear", aliases: &["new"], description: "Clear the transcript, keep the session.", takes_args: false },
+    CommandHint { name: "reset", aliases: &[], description: "Dispose the current session and start fresh.", takes_args: false },
+    CommandHint { name: "quit", aliases: &[], description: "Exit cusa.", takes_args: false },
+    CommandHint { name: "model", aliases: &[], description: "Pick a model or set one (<id|auto>).", takes_args: true },
+    CommandHint { name: "mode", aliases: &[], description: "Change approval mode (alias for /approval).", takes_args: true },
+    CommandHint { name: "approval", aliases: &[], description: "Cycle or pick the approval mode.", takes_args: true },
+    CommandHint { name: "skills", aliases: &[], description: "Toggle skill injection.", takes_args: false },
+    CommandHint { name: "mcp", aliases: &[], description: "Inspect / toggle MCP servers.", takes_args: false },
+    CommandHint { name: "cost", aliases: &[], description: "Show per-turn cost + per-model aggregates.", takes_args: false },
+    CommandHint { name: "resume", aliases: &[], description: "Resume a prior session.", takes_args: true },
+    CommandHint { name: "context", aliases: &[], description: "Force history strategy (strategy=<auto|raw|summary>).", takes_args: true },
 ];
 
 /// Extract the popup prefix from the composer buffer: the command token
@@ -204,19 +232,20 @@ pub fn popup_prefix(input: &str) -> Option<&str> {
     Some(rest)
 }
 
-/// Case-insensitive prefix filter over the suggestable commands. An exact
-/// name match sorts first so Enter never fires a longer sibling (e.g.
-/// typing `/mode` must not run `/model`).
+/// Case-insensitive prefix filter over the suggestable commands, matching
+/// canonical names and aliases alike (typing `/new` surfaces `/clear`).
+/// An exact match (name or alias) sorts first so Enter never fires a
+/// longer sibling (e.g. typing `/mode` must not run `/model`).
 pub fn suggestions(prefix: &str) -> Vec<CommandHint> {
     let needle = prefix.to_ascii_lowercase();
     let mut out: Vec<CommandHint> = SUGGESTABLE
         .iter()
         .copied()
-        .filter(|c| c.name.starts_with(needle.as_str()))
+        .filter(|c| c.matches_prefix(needle.as_str()))
         .collect();
     // `false < true`, and the sort is stable: the exact match (if any)
     // moves to the front, everything else keeps display order.
-    out.sort_by_key(|c| c.name != needle);
+    out.sort_by_key(|c| !c.matches_exact(needle.as_str()));
     out
 }
 
@@ -242,6 +271,8 @@ mod tests {
     #[test]
     fn spec_002_parse_core_commands() {
         assert_eq!(parse("/clear"), Some(SlashCommand::Clear));
+        assert_eq!(parse("/new"), Some(SlashCommand::Clear));
+        assert_eq!(parse("/NEW"), Some(SlashCommand::Clear));
         assert_eq!(parse("/reset"), Some(SlashCommand::Reset));
         assert_eq!(parse("/quit"), Some(SlashCommand::Quit));
         assert_eq!(parse("/exit"), Some(SlashCommand::Quit));
@@ -326,7 +357,7 @@ mod tests {
         let names: Vec<&&str> = help_entries().iter().map(|(n, _)| n).collect();
         for expected in [
             "/help",
-            "/clear",
+            "/clear (/new)",
             "/reset",
             "/quit",
             "/model <id|auto>",
@@ -376,6 +407,37 @@ mod tests {
                 "/{} must be a known command",
                 hint.name
             );
+            // Every advertised alias must parse to the same command as the
+            // canonical name (keeps SUGGESTABLE in sync with `parse`).
+            for alias in hint.aliases {
+                let alias_parsed = parse(&format!("/{alias}")).expect("alias parses");
+                assert_eq!(
+                    alias_parsed.name(),
+                    parsed.name(),
+                    "/{alias} must run /{}",
+                    hint.name
+                );
+            }
         }
+    }
+
+    #[test]
+    fn spec_002_suggestions_match_aliases() {
+        // Typing `/n`, `/ne`, `/new` must surface /clear via its alias.
+        for p in ["n", "ne", "new", "NEW"] {
+            let names: Vec<&str> = suggestions(p).iter().map(|c| c.name).collect();
+            assert_eq!(names, vec!["clear"], "prefix {p:?} must suggest clear");
+        }
+        // Overshooting the alias hides it again.
+        assert!(suggestions("news").is_empty());
+    }
+
+    #[test]
+    fn spec_002_clear_hint_label_advertises_alias_but_stays_canonical() {
+        let hint = suggestions("new")[0];
+        assert_eq!(hint.label(), "clear (new)", "popup label shows the alias");
+        assert_eq!(hint.name, "clear", "Tab/Enter complete the canonical name");
+        // Hints without aliases keep their plain label.
+        assert_eq!(suggestions("help")[0].label(), "help");
     }
 }

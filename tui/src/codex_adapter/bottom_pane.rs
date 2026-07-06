@@ -62,7 +62,7 @@ fn popup_lines(state: &AppState) -> Vec<Line<'static>> {
     let start = (selected + 1).saturating_sub(MAX_POPUP_ROWS);
     let name_width = suggestions
         .iter()
-        .map(|c| c.name.len())
+        .map(|c| c.label().len())
         .max()
         .unwrap_or(0);
     suggestions
@@ -76,7 +76,9 @@ fn popup_lines(state: &AppState) -> Vec<Line<'static>> {
 
 fn popup_line(hint: &CommandHint, selected: bool, name_width: usize) -> Line<'static> {
     let marker = if selected { "\u{203a} " } else { "  " };
-    let name = format!("/{:<width$}", hint.name, width = name_width);
+    // Display label includes aliases — `/clear (new)` — but Tab/Enter
+    // always complete/execute the canonical `hint.name`.
+    let name = format!("/{:<width$}", hint.label(), width = name_width);
     let name_span = if selected {
         Span::styled(name, Style::default().fg(Color::Cyan)).bold()
     } else {
@@ -205,6 +207,18 @@ mod tests {
         assert!(
             popup_row < composer_row,
             "popup must render above the composer (popup row {popup_row}, composer row {composer_row}): {rows:?}"
+        );
+    }
+
+    #[test]
+    fn spec_002_popup_shows_alias_label_for_clear() {
+        let mut state = AppState::new("/tmp".into());
+        state.input = "/new".into();
+        state.cursor_pos = 4;
+        let out = render_to_string(&state, 100, 10);
+        assert!(
+            out.contains("/clear (new)"),
+            "typing /new must surface the aliased /clear row: {out}"
         );
     }
 
