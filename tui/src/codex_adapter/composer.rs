@@ -93,11 +93,15 @@ impl ComposerWidget {
         }
         let bottom = composer_bottom_rect(screen, state)?;
         let mut composer_area = Self::composer_area_in_bottom_pane(bottom);
-        // The slash-command suggestion popup renders above the composer
-        // inside the bottom pane; shift the IME cursor down accordingly.
-        let popup_rows = crate::codex_adapter::bottom_pane::BottomPaneWidget::popup_rows(state);
-        composer_area.y = composer_area.y.saturating_add(popup_rows);
-        composer_area.height = composer_area.height.saturating_sub(popup_rows);
+        // The slash-command suggestion popup and the activity indicator
+        // both render above the composer inside the bottom pane; shift the
+        // IME cursor down accordingly.
+        let rows_above = crate::codex_adapter::bottom_pane::BottomPaneWidget::popup_rows(state)
+            .saturating_add(crate::codex_adapter::bottom_pane::BottomPaneWidget::activity_rows(
+                state,
+            ));
+        composer_area.y = composer_area.y.saturating_add(rows_above);
+        composer_area.height = composer_area.height.saturating_sub(rows_above);
         let textarea_rect = Self::textarea_rect(composer_area);
         if textarea_rect.is_empty() {
             return None;
