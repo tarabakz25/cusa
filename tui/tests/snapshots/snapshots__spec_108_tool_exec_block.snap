@@ -1,0 +1,5 @@
+---
+source: tui/tests/snapshots.rs
+expression: "render_tool_block_snapshot(&entry, Path::new(\"/tmp/repo\"), 80, 4)"
+---
+• Running echo ok

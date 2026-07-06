@@ -23,6 +23,17 @@ set -euo pipefail
 FORKED_PATHS=(
   "tui/src"
   "tui/crates/cusa-rpc/src"
+  "tui/vendor/codex-ui"
+)
+
+# Paths where we also require OpenAI vendoring provenance (SPEC-111).
+VENDORED_PATHS=(
+  "tui/vendor/codex-ui"
+)
+
+PROVENANCE_MARKERS=(
+  "openai/codex"
+  "Vendored from"
 )
 
 MARKERS=(
@@ -61,6 +72,7 @@ if [ "$LIST_ONLY" = "1" ]; then
 fi
 
 missing=()
+missing_provenance=()
 if [ "${#files[@]}" -gt 0 ]; then
   for f in "${files[@]}"; do
     head=$(head -n 40 "$f" 2>/dev/null || true)
@@ -74,6 +86,23 @@ if [ "${#files[@]}" -gt 0 ]; then
     if [ "$found" = "0" ]; then
       missing+=("$f")
     fi
+
+    for base in "${VENDORED_PATHS[@]}"; do
+      case "$f" in
+        "$base"/*)
+          prov_found=0
+          for p in "${PROVENANCE_MARKERS[@]}"; do
+            if printf "%s" "$head" | grep -qF "$p"; then
+              prov_found=1
+              break
+            fi
+          done
+          if [ "$prov_found" = "0" ]; then
+            missing_provenance+=("$f")
+          fi
+          ;;
+      esac
+    done
   done
 fi
 
@@ -83,6 +112,15 @@ if [ "${#missing[@]}" -ne 0 ]; then
   echo "" >&2
   echo "Add one of these markers within the first 40 lines:" >&2
   for m in "${MARKERS[@]}"; do echo "  - $m" >&2; done
+  exit 1
+fi
+
+if [ "${#missing_provenance[@]}" -ne 0 ]; then
+  echo "check-headers: the following vendored files are missing OpenAI provenance:" >&2
+  for f in "${missing_provenance[@]}"; do echo "  $f" >&2; done
+  echo "" >&2
+  echo "Add a provenance comment within the first 40 lines, e.g.:" >&2
+  echo "  // Vendored from openai/codex codex-rs/tui — see UPSTREAM" >&2
   exit 1
 fi
 

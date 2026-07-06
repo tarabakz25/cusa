@@ -1,12 +1,16 @@
 [package]
 name = "cusa-tui"
 version.workspace = true
-edition.workspace = true
+edition = "2024"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "cusa terminal UI (Rust/Ratatui) — Cursor SDK-powered coding CLI"
+
+[lib]
+name = "cusa_tui"
+path = "src/lib.rs"
 
 [[bin]]
 name = "cusa-tui"
@@ -21,8 +25,46 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# SPEC-114: ratatui features are declared in the workspace root; each flag is
+# required by vendored Codex foundation modules under `vendor/codex-ui/`:
+# - scrolling-regions — `custom_terminal` uses `Terminal::insert_before` without
+#   viewport flicker (upstream ratatui 0.29 scrolling-region backend hooks).
+# - unstable-widget-ref — `custom_terminal::Frame::render_widget_ref` and future
+#   ported widgets render via `WidgetRef` instead of consuming widgets.
+# - unstable-rendered-line-info — transcript/composer reflow in later phases uses
+#   `Paragraph::line_count` / `line_width` for virtualized history layout.
 ratatui.workspace = true
 crossterm.workspace = true
+derive_more.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+supports-color.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+textwrap = "0.16"
 directories = "5"
+# P2 transcript markdown pipeline (SPEC-107)
+pulldown-cmark = "0.10"
+regex-lite = "0.1"
+url = "2"
+dirs = "5"
+syntect = "5"
+two-face = { version = "0.5", default-features = false, features = ["syntect-default-onig"] }
+base64 = "0.22"
+image = "0.25"
+# P3 tool display (SPEC-108)
+diffy = "0.5"
+urlencoding = "2"
+shlex = "1"
+itertools = "0.13"
+
+[dev-dependencies]
+pretty_assertions = "1"
+insta = { version = "1", features = ["yaml"] }
+
+[package.metadata.insta]
+snapshot-path = "tests/snapshots"
+
+[features]
+default = []
+vendor-tests = []

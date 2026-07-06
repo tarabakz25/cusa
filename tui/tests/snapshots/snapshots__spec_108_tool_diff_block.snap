@@ -1,0 +1,5 @@
+---
+source: tui/tests/snapshots.rs
+expression: "render_tool_block_snapshot(&entry, Path::new(\"/tmp/repo\"), 80, 10)"
+---
+• Added src/main.rs (+1 -0)                                                            1 +fn main() {}

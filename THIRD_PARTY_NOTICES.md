@@ -6,23 +6,27 @@ distributed binaries.
 
 ## Included forks / derivative work
 
-### OpenAI Codex TUI (`codex-rs/tui`)
+### OpenAI Codex TUI (`codex-rs/tui`) — SPEC-112
 
-Portions of `tui/` are derived from OpenAI's Codex Rust TUI
-(`codex-rs/tui`), which is distributed under the Apache License, Version 2.0.
+Portions of `tui/vendor/codex-ui/` are vendored from OpenAI's Codex Rust TUI
+(`codex-rs/tui`), Apache License, Version 2.0. Pin: `tui/vendor/codex-ui/UPSTREAM`;
+import: `scripts/vendor-codex-ui.sh` (SPEC-103).
 
 - Upstream: https://github.com/openai/codex
 - License: Apache License, Version 2.0
-- Notice: Files derived from upstream retain their original license headers
-  and are re-licensed under Apache-2.0 in this project. See the Apache-2.0
-  LICENSE at the root of this repository.
 
-The following files are known to be forked or heavily derived from the
-upstream codex-tui crate. The list is maintained by the SPEC-083 header
-check (`scripts/check-headers.sh`) and grows as we cherry-pick more of the
-upstream widgets:
+**Vendored paths** (representative; see `tui/vendor/codex-ui/` for the full tree):
 
-- `tui/src/**` — general Ratatui rendering and widget layout patterns.
+| Phase | Paths |
+|-------|--------|
+| P0 foundation | `custom_terminal.rs`, `style.rs`, `ui_consts.rs`, `terminal_palette.rs`, `color.rs`, `wrapping.rs`, `width.rs`, `text_formatting.rs`, `render/**` |
+| P1 composer | `bottom_pane/**`, `key_hint.rs`, `keymap.rs` |
+| P2 transcript | `history_cell/**`, `markdown*.rs`, `streaming/**`, `thread_transcript.rs`, `transcript_reflow.rs`, … |
+| P3 tools | `diff_model.rs`, `diff_render.rs`, `exec_cell/**`, `exec_command.rs` |
+| P4 chrome | `status_chrome.rs`, `shimmer.rs`, `motion.rs` |
+
+`tui/src/**` (outside `vendor/`) is cusa-authored adapter and app code following
+Codex UX conventions; checked by `scripts/check-headers.sh` (SPEC-083, SPEC-111).
 
 Modifications made by cusa contributors are Copyright 2026 cusa contributors
 and are also licensed under Apache-2.0.

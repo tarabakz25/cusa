@@ -24,20 +24,9 @@
 // this at CI time and the integration test at `tui/tests/headers.rs`
 // mirrors that check in-process (`spec_083_every_rust_file_carries_apache_header`).
 
-// Slice 2 exposes helpers to submodules that the binary itself doesn't call
-// directly (test-only helpers, configuration stubs, etc.). Suppress the
-// dead-code and unused-imports lints globally so we can keep those helpers
-// `pub` for future slices without gating every one behind `#[cfg(test)]`.
-#![allow(dead_code, unused_imports)]
-
-mod app;
-mod config;
-mod logging;
-mod session_store;
-mod sidecar;
-
 use anyhow::{Context, Result};
 use clap::Parser;
+use cusa_tui::{app, logging, session_store, sidecar};
 use serde_json::Value;
 
 /// cusa — Cursor-SDK-powered coding CLI with transparent auto-mode.

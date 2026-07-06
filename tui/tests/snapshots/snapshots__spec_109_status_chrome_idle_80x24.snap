@@ -1,0 +1,5 @@
+---
+source: tui/tests/snapshots.rs
+expression: "render_status_chrome_snapshot(&state, 80)"
+---
+auto · suggest · /tmp/repo
