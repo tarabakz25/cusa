@@ -8,7 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::app::state::SessionView;
 use crate::app::transcript::{TranscriptEntry, TurnState};
+use crate::codex_adapter::welcome;
 use crate::codex_adapter::tool_display;
 use crate::codex_adapter::types::{HistoryCellView, RouterSourceView};
 use crate::codex_adapter::view_model::CusaViewModel;
@@ -177,6 +179,7 @@ pub fn render_transcript_lines(cells: &[Arc<dyn HistoryCell>], width: u16) -> Ve
 pub struct CodexTranscriptWidget<'a> {
     entries: &'a [TranscriptEntry],
     live_turn: Option<&'a TurnState>,
+    session: Option<&'a SessionView>,
     cwd: &'a Path,
     scroll: u16,
 }
@@ -190,9 +193,15 @@ impl<'a> CodexTranscriptWidget<'a> {
         Self {
             entries,
             live_turn,
+            session: None,
             cwd,
             scroll: 0,
         }
+    }
+
+    pub fn with_session(mut self, session: &'a SessionView) -> Self {
+        self.session = Some(session);
+        self
     }
 
     pub fn with_scroll(mut self, scroll: u16) -> Self {
@@ -201,24 +210,32 @@ impl<'a> CodexTranscriptWidget<'a> {
     }
 
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        let show_welcome = self.entries.is_empty()
+            && self.live_turn.is_none()
+            && self.session.is_some();
+        if show_welcome {
+            let session = self.session.expect("session set when show_welcome");
+            for cell in welcome::welcome_cells(session) {
+                out.extend(cell.display_lines(width));
+                out.push(Line::from(""));
+            }
+        }
+
         let views = CusaViewModel::history_cells(self.entries, self.live_turn);
         let cells = views_to_transcript_cells(&views, self.cwd);
-        render_transcript_lines(&cells, width)
+        out.extend(render_transcript_lines(&cells, width));
+        out
     }
 }
 
 impl<'a> Widget for CodexTranscriptWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let lines = self.lines(area.width);
-        let block = Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::DarkGray));
-        let inner = block.inner(area);
-        block.render(area, buf);
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((self.scroll, 0))
-            .render(inner, buf);
+            .render(area, buf);
     }
 }
 

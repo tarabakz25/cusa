@@ -4,6 +4,7 @@
 // Adapter boundary between cusa domain state and vendored Codex UI modules
 // (SPEC-104, SPEC-105, SPEC-106). Vendor code must not import `crate::app` or sidecar.
 
+pub mod bottom_pane;
 pub mod composer;
 pub mod shim;
 pub mod status_chrome;
@@ -12,7 +13,9 @@ pub mod tool_display;
 pub mod transcript;
 pub mod types;
 pub mod view_model;
+pub mod welcome;
 
+pub use bottom_pane::BottomPaneWidget;
 pub use composer::{ComposerKeyResult, ComposerWidget, handle_composer_key};
 pub use types::{
     ApprovalModeView, ComposerView, HistoryCellView, RouterSourceView, RunPhaseView,

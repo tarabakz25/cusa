@@ -99,6 +99,14 @@ impl Widget for ComposerWidget {
             );
         }
 
+        if self.buffer.is_empty() && self.active {
+            let placeholder = Span::from("Type your message...").dim();
+            let ph_x = textarea_rect.x.saturating_add(1);
+            if textarea_rect.width > 1 {
+                buf.set_span(ph_x, textarea_rect.y, &placeholder, textarea_rect.width - 1);
+            }
+        }
+
         (&textarea).render_ref(textarea_rect, buf);
     }
 }

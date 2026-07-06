@@ -5,14 +5,13 @@
 // Codex TUI cherry-pick). Snapshots live under `tui/tests/snapshots/`.
 
 use cusa_tui::app::draw_to_buffer;
-use cusa_tui::codex_adapter::ComposerWidget;
+use cusa_tui::codex_adapter::{BottomPaneWidget, CodexTranscriptWidget};
 use cusa_tui::app::state::{AppState, RunPhase};
-use cusa_tui::app::status::{HeaderWidget, StatusWidget};
 use cusa_tui::app::transcript::{TranscriptEntry, TurnState};
 use cusa_tui::codex_adapter::tool_display;
+use cusa_tui::codex_adapter::welcome::composer_footer_line;
 use cusa_rpc::RouterSource;
 use ratatui::backend::TestBackend;
-use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 use ratatui::Terminal;
 use std::path::Path;
@@ -36,14 +35,27 @@ fn render_app_snapshot(state: &AppState, width: u16, height: u16) -> String {
     buffer_string(&terminal)
 }
 
-/// Render the vendored composer widget alone (SPEC-106 P1).
-fn render_composer_snapshot(state: &AppState, width: u16, height: u16) -> String {
+/// Render the vendored bottom pane (composer + footer status).
+fn render_bottom_pane_snapshot(state: &AppState, width: u16, height: u16) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    let widget = ComposerWidget::from_state(state);
+    let widget = BottomPaneWidget::from_state(state);
     terminal
         .draw(|f| {
             f.render_widget(widget, f.area());
+        })
+        .unwrap();
+    buffer_string(&terminal)
+}
+
+fn render_composer_footer_snapshot(state: &AppState, width: u16) -> String {
+    let backend = TestBackend::new(width, 1);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let line = composer_footer_line(&state.session);
+    terminal
+        .draw(|f| {
+            use ratatui::widgets::Paragraph;
+            Paragraph::new(line).render(f.area(), f.buffer_mut());
         })
         .unwrap();
     buffer_string(&terminal)
@@ -58,7 +70,8 @@ fn render_transcript_snapshot(state: &AppState, width: u16, height: u16) -> Stri
         &state.transcript,
         state.current_turn.as_ref(),
         Path::new(&state.session.cwd),
-    );
+    )
+    .with_session(&state.session);
     terminal
         .draw(|f| {
             f.render_widget(widget, f.area());
@@ -81,31 +94,7 @@ fn render_tool_block_snapshot(entry: &TranscriptEntry, cwd: &Path, width: u16, h
 }
 
 fn render_status_chrome_snapshot(state: &AppState, width: u16) -> String {
-    let backend = TestBackend::new(width, 2);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|f| {
-            HeaderWidget::new(state).render(
-                Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height: 1,
-                },
-                f.buffer_mut(),
-            );
-            StatusWidget::new(state).render(
-                Rect {
-                    x: 0,
-                    y: 1,
-                    width,
-                    height: 1,
-                },
-                f.buffer_mut(),
-            );
-        })
-        .unwrap();
-    buffer_string(&terminal)
+    render_composer_footer_snapshot(state, width)
 }
 
 #[test]
@@ -123,7 +112,7 @@ fn spec_110_p0_foundation_idle_frame_120x40() {
 #[test]
 fn spec_110_p1_composer_idle() {
     let state = AppState::new("/tmp/repo".into());
-    insta::assert_snapshot!(render_composer_snapshot(&state, 80, 3));
+    insta::assert_snapshot!(render_bottom_pane_snapshot(&state, 80, 4));
 }
 
 #[test]

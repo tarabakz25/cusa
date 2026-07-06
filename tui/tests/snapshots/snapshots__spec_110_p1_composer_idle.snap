@@ -1,5 +1,5 @@
 ---
 source: tui/tests/snapshots.rs
-expression: render_composer_snapshot(&state, 80, 3)
+expression: "render_bottom_pane_snapshot(&state, 80, 4)"
 ---
-────────────────────────────────────────────────────────────────────────────────›
+────────────────────────────────────────────────────────────────────────────────›Type your message...                                                                                                                                           auto · suggest · /tmp/repo

@@ -7,7 +7,6 @@
 pub mod approval;
 pub mod context;
 pub mod events;
-pub mod footer;
 pub mod internal;
 pub mod login;
 pub mod mcp;
@@ -22,8 +21,7 @@ pub mod transcript;
 pub mod usage;
 
 use crate::app::events::{spawn_input, TuiEvent};
-use crate::app::footer::FooterWidget;
-use crate::codex_adapter::{ComposerKeyResult, ComposerWidget, handle_composer_key};
+use crate::codex_adapter::{BottomPaneWidget, ComposerKeyResult, handle_composer_key};
 use crate::app::internal::{channel as internal_channel, AppInternalEvent, AppInternalRx};
 use crate::app::overlay::{
     cycle_approval_mode, ApprovalPickerOverlay, McpOverlay, ModelPickerOverlay, Overlay,
@@ -31,7 +29,6 @@ use crate::app::overlay::{
 };
 use crate::app::slash::SlashCommand;
 use crate::app::state::{AppState, CtrlCOutcome, RunPhase, SidecarStatusView};
-use crate::app::status::{HeaderWidget, StatusWidget};
 use crate::app::transcript::{TranscriptEntry, TurnState};
 use crate::codex_adapter::transcript::CodexTranscriptWidget;
 use crate::sidecar::events::{SidecarEvent, SidecarStatus};
@@ -48,20 +45,17 @@ use std::path::Path;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-/// Split the screen into (header, status, transcript, input, footer).
-pub fn compute_layout(area: Rect, state: &AppState) -> [Rect; 5] {
-    let input_height = ComposerWidget::desired_height_for_state(state, area.width);
+/// Split the screen into (transcript, bottom pane) — Codex chat layout.
+pub fn compute_layout(area: Rect, state: &AppState) -> [Rect; 2] {
+    let bottom_height = BottomPaneWidget::desired_height(state, area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
+            Constraint::Length(bottom_height),
         ])
         .split(area);
-    [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
+    [chunks[0], chunks[1]]
 }
 
 /// Trait abstraction so `draw()` works with both ratatui and Codex `custom_terminal` frames.
@@ -92,19 +86,17 @@ impl RenderFrame for crate::codex_ui::custom_terminal::Frame<'_> {
 
 /// Render one frame of the app into any frame type (ratatui or custom_terminal).
 fn render_app_ui<F: RenderFrame>(state: &AppState, frame: &mut F) {
-    let [header, status, transcript, input, footer] = compute_layout(frame.area(), state);
-    frame.render_widget(HeaderWidget::new(state), header);
-    frame.render_widget(StatusWidget::new(state), status);
+    let [transcript, bottom] = compute_layout(frame.area(), state);
     frame.render_widget(
         CodexTranscriptWidget::new(
             &state.transcript,
             state.current_turn.as_ref(),
             Path::new(&state.session.cwd),
-        ),
+        )
+        .with_session(&state.session),
         transcript,
     );
-    frame.render_widget(ComposerWidget::from_state(state), input);
-    frame.render_widget(FooterWidget::new(state), footer);
+    frame.render_widget(BottomPaneWidget::from_state(state), bottom);
     if state.overlay.is_open() {
         frame.render_widget(OverlayWidget::new(&state.overlay), frame.area());
     }
@@ -1001,17 +993,17 @@ mod tests {
     }
 
     #[test]
-    fn spec_001_empty_transcript_layout_renders_five_regions() {
+    fn spec_001_empty_transcript_layout_renders_codex_idle_screen() {
         let state = AppState::new("/tmp/repo".into());
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         draw_to_buffer(&state, &mut terminal).unwrap();
         let s = buffer_string(&terminal);
-        assert!(s.contains("cusa"));
-        assert!(s.contains("/tmp/repo"));
-        assert!(s.contains("skills(0)"));
-        assert!(s.contains("mcp(0)"));
-        assert!(s.contains("Ctrl-C exit"), "footer missing: {s:?}");
+        assert!(s.contains("cusa"), "welcome header missing: {s:?}");
+        assert!(s.contains("/tmp/repo"), "directory missing: {s:?}");
+        assert!(s.contains("model:"), "session card missing: {s:?}");
+        assert!(s.contains("Type your message"), "composer placeholder missing: {s:?}");
+        assert!(s.contains("suggest"), "composer footer mode missing: {s:?}");
     }
 
     #[tokio::test]
