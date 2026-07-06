@@ -1,0 +1,37 @@
+# Copyright 2026 cusa contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI smoke tests for the npm shim + header check. Commented until the rest
+# of the repository is wired up on CI. Enable by removing the `if: false`.
+
+name: ci
+
+on:
+  # pull_request:
+  # push:
+  #   branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  npm-shim-tests:
+    if: false # remove when ready
+    strategy:
+      matrix:
+        node: ["20", "22", "24"]
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run tests
+        working-directory: npm
+        run: node --test tests/*.test.js
+
+  header-check:
+    if: false # remove when ready
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-headers.sh

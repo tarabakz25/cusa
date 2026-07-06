@@ -1,0 +1,820 @@
+// Copyright 2026 cusa contributors
+// SPDX-License-Identifier: Apache-2.0
+//
+// SessionManager: owns Cursor SDK agents (via SdkAdapter), streams events
+// out as RPC notifications, and mediates tool-approval bridging.
+//
+// SPEC IDs relevant here:
+// - SPEC-001: streaming assistant deltas as `stream/message`.
+// - SPEC-004: `session/cancel` → run.cancel() with a 3 s settle window.
+// - SPEC-060/061: cumulative + per-turn token usage accounting.
+// - SPEC-071: hosts `@cursor/sdk`.
+// - SPEC-100: never returns the API key on the wire.
+
+import { randomUUID } from "node:crypto";
+
+import { approvalPolicy, shouldEnableSandbox } from "../approval/policy.js";
+import { readApiKey, type ApiKeySource } from "../config/apiKey.js";
+import { Router, type RouteContext } from "../router/index.js";
+import {
+  Method,
+  RpcErrorCode,
+  type ApprovalDecision,
+  type ApprovalMode,
+  type ContextSetStrategyParams,
+  type McpListParams,
+  type McpListResult,
+  type McpToggleParams,
+  type McpToggleResult,
+  type ModelInfo,
+  type Ok,
+  type SessionCancelParams,
+  type SessionCreateParams,
+  type SessionCreateResult,
+  type SessionDisposeParams,
+  type SessionResumeParams,
+  type SessionResumeResult,
+  type SessionSendParams,
+  type SessionSendResult,
+  type SessionSetApprovalModeParams,
+  type SessionSetApprovalModeResult,
+  type SkillInfo,
+  type SkillsListParams,
+  type SkillsListResult,
+  type SkillsSetEnabledParams,
+  type TokenUsage,
+  type ToolApprovalResponseParams,
+} from "../rpc/schema.js";
+import { UsageAccumulator, TurnUsageTracker } from "../usage/accumulator.js";
+import { McpManager, type McpServerConfigMap } from "../mcp/index.js";
+import { SkillsManager } from "../skills/index.js";
+import { ContextManager } from "../context/index.js";
+import type { AgentHandle, SdkAdapter, TurnHandle } from "./sdkAdapter.js";
+
+const CANCEL_SETTLE_MS = 3000;
+
+export interface NotifyFn {
+  (method: string, params: unknown): void;
+}
+
+export interface SessionManagerOptions {
+  adapter: SdkAdapter;
+  notify: NotifyFn;
+  log?: (level: "info" | "warn" | "error", msg: string) => void;
+  readApiKey?: typeof readApiKey;
+  now?: () => number;
+  /**
+   * Optional router. When omitted, a Router with built-in defaults is
+   * used (rules only, no LLM classifier).
+   */
+  router?: Router;
+  skills?: SkillsManager;
+  mcp?: McpManager;
+  /**
+   * Context manager (SPEC-090..093). When omitted, a default instance
+   * with manual injection ON and no summarizer client is used.
+   */
+  context?: ContextManager;
+}
+
+interface PendingApproval {
+  requestId: string;
+  resolve: (decision: ApprovalDecision) => void;
+}
+
+interface SessionState {
+  sessionId: string;
+  agent: AgentHandle;
+  approvalMode: ApprovalMode;
+  usage: UsageAccumulator;
+  enabledSkillIds: string[];
+  mcpOverrides: unknown;
+  cwd: string;
+  defaultModel: string | undefined;
+  currentModel: string | undefined;
+  activeRun: ActiveRunState | null;
+  /** Tool names for which the user selected "always" this session. */
+  alwaysApprovedTools: Set<string>;
+  /** Enabled MCP server ids (subset of mcp/list). */
+  enabledMcpServerIds: Set<string> | null;
+  /** Cached one-time observational-approval warning flag. */
+  observationalWarnEmitted: boolean;
+}
+
+interface ActiveRunState {
+  runId: string;
+  turn: TurnHandle;
+  turnUsage: TurnUsageTracker;
+  pendingApprovals: Map<string, PendingApproval>;
+  effectiveModel: string | undefined;
+  /** Text of the user prompt that started this run. */
+  userPrompt: string;
+  /** Assistant deltas accumulated for the ConversationHistory. */
+  assistantBuffer: string[];
+  /** Human-readable tool-call summary lines for the completed turn. */
+  toolCallsSummary: string[];
+  /** Track tool names + arg previews between call-start and call-end. */
+  toolCallInfo: Map<string, { name: string; argPreview: string }>;
+}
+
+/**
+ * Thrown by SessionManager methods to produce a typed RPC error.
+ */
+export class SessionRpcError extends Error {
+  constructor(
+    public readonly code: number,
+    message: string,
+    public readonly data?: unknown,
+  ) {
+    super(message);
+    this.name = "SessionRpcError";
+  }
+}
+
+export class SessionManager {
+  private readonly adapter: SdkAdapter;
+  private readonly notify: NotifyFn;
+  private readonly log: (level: "info" | "warn" | "error", msg: string) => void;
+  private readonly readKey: typeof readApiKey;
+  private readonly sessions = new Map<string, SessionState>();
+  private modelsCache: ModelInfo[] | null = null;
+  private readonly router: Router;
+  private readonly skills: SkillsManager;
+  private readonly mcp: McpManager;
+  private readonly context: ContextManager;
+
+  constructor(opts: SessionManagerOptions) {
+    this.adapter = opts.adapter;
+    this.notify = opts.notify;
+    this.log = opts.log ?? (() => {});
+    this.readKey = opts.readApiKey ?? readApiKey;
+    this.router = opts.router ?? new Router({ log: this.log });
+    this.skills = opts.skills ?? new SkillsManager({ log: this.log });
+    this.mcp = opts.mcp ?? new McpManager({ log: this.log });
+    this.context = opts.context ?? new ContextManager({ log: this.log });
+  }
+
+  // -------- API key -----------------------------------------------------
+
+  private cachedKey: ApiKeySource | null = null;
+  private keyChecked = false;
+
+  private async requireApiKey(): Promise<string> {
+    if (!this.keyChecked) {
+      this.cachedKey = await this.readKey();
+      this.keyChecked = true;
+    }
+    if (!this.cachedKey) {
+      throw new SessionRpcError(
+        RpcErrorCode.NoApiKey,
+        "CURSOR_API_KEY is not set. Run `cusa login` or export CURSOR_API_KEY.",
+      );
+    }
+    return this.cachedKey.key;
+  }
+
+  // -------- models/list -------------------------------------------------
+
+  async listModels(): Promise<{ models: ModelInfo[] }> {
+    if (this.modelsCache) return { models: this.modelsCache };
+    // Trigger key resolution so we surface NO_API_KEY cleanly.
+    await this.requireApiKey();
+    try {
+      const models = await this.adapter.listModels();
+      this.modelsCache = models;
+      return { models };
+    } catch (err) {
+      throw this.wrapAgentError(err, "models/list failed");
+    }
+  }
+
+  // -------- session/create ---------------------------------------------
+
+  async createSession(
+    params: SessionCreateParams,
+  ): Promise<SessionCreateResult> {
+    const apiKey = await this.requireApiKey();
+    const approvalMode: ApprovalMode = params.approvalMode ?? "suggest";
+    // Compose the initial MCP server map so the SDK gets a coherent
+    // creation-time config; every session/send re-passes it because
+    // inline mcpServers replace creation-time servers per SDK docs.
+    const composedMcp = await this.mcp.compose({
+      cwd: params.cwd,
+      inline: params.mcpOverrides,
+    });
+    try {
+      const agent = await this.adapter.createAgent({
+        cwd: params.cwd,
+        model: params.model,
+        approvalMode,
+        settingSources: params.settingSources ?? ["user", "project"],
+        mcpOverrides: composedMcp,
+        apiKey,
+      });
+      const sessionId = `sess_${randomUUID()}`;
+      const state: SessionState = {
+        sessionId,
+        agent,
+        approvalMode,
+        usage: new UsageAccumulator(),
+        enabledSkillIds: params.enabledSkillIds ?? [],
+        mcpOverrides: params.mcpOverrides,
+        cwd: params.cwd,
+        defaultModel: params.model,
+        currentModel: agent.model ?? params.model,
+        activeRun: null,
+        alwaysApprovedTools: new Set(),
+        enabledMcpServerIds: null, // null = "all enabled"
+        observationalWarnEmitted: false,
+      };
+      this.sessions.set(sessionId, state);
+      this.context.registerSession(sessionId);
+      this.assertSandboxCoupling(approvalMode);
+      return {
+        sessionId,
+        agentId: agent.agentId,
+        model: state.currentModel ?? "",
+      };
+    } catch (err) {
+      if (err instanceof SessionRpcError) throw err;
+      throw this.wrapAgentError(err, "session/create failed");
+    }
+  }
+
+  // -------- session/send -----------------------------------------------
+
+  async sendMessage(
+    params: SessionSendParams,
+  ): Promise<SessionSendResult> {
+    const session = this.getSession(params.sessionId);
+    if (session.activeRun) {
+      throw new SessionRpcError(
+        RpcErrorCode.AgentError,
+        "a run is already active for this session (queue_mode=reject)",
+      );
+    }
+    await this.requireApiKey();
+
+    // Route this turn. When the caller passed `modelOverride`, we honour
+    // that (per-call sticky override); otherwise we delegate to the
+    // Router pipeline.
+    const routeCtx: RouteContext = { prompt: params.text };
+    if (session.currentModel !== undefined) {
+      routeCtx.currentModel = session.currentModel;
+    }
+    if (session.defaultModel !== undefined) {
+      routeCtx.defaultModel = session.defaultModel;
+    }
+    if (params.modelOverride !== undefined) {
+      routeCtx.sessionManualModel = params.modelOverride;
+    }
+    if (session.enabledSkillIds.length > 0) {
+      routeCtx.enabledSkills = [...session.enabledSkillIds];
+    }
+    const decision = await this.router.route(routeCtx);
+    const effectiveModel = decision.model;
+
+    // Build the system-context block (skills + conversation history) and
+    // compose the per-turn MCP server map (inline replaces creation-time).
+    const systemContext = await this.buildSystemContext(session);
+    const mcpForTurn = await this.mcp.composeForTurn({
+      cwd: session.cwd,
+      inline: session.mcpOverrides,
+      enabledIds: session.enabledMcpServerIds,
+    });
+
+    let turn: TurnHandle;
+    let runId: string;
+
+    try {
+      const sendOptions: import("./sdkAdapter.js").SendOptions = {
+        modelOverride: effectiveModel,
+        onEvent: (event) => this.dispatchTurnEvent(session, event),
+      };
+      if (systemContext !== undefined) sendOptions.systemContext = systemContext;
+      if (mcpForTurn !== undefined) sendOptions.mcpServers = mcpForTurn;
+      turn = await session.agent.send(params.text, sendOptions);
+      runId = turn.runId;
+    } catch (err) {
+      throw this.wrapAgentError(err, "session/send failed");
+    }
+
+    const active: ActiveRunState = {
+      runId,
+      turn,
+      turnUsage: new TurnUsageTracker(),
+      pendingApprovals: new Map(),
+      effectiveModel,
+      userPrompt: params.text,
+      assistantBuffer: [],
+      toolCallsSummary: [],
+      toolCallInfo: new Map(),
+    };
+    session.activeRun = active;
+
+    // Emit router/decision so the TUI has a decision line to render.
+    this.notify(Method.RouterDecision, {
+      sessionId: session.sessionId,
+      runId,
+      model: effectiveModel,
+      rationale: decision.rationale,
+      source: decision.source,
+    });
+
+    // Fire and forget: consume the turn and emit finish/error events.
+    // We intentionally do not await here — the sidecar returns runId to the
+    // TUI immediately; final settlement is signalled via run/finished.
+    void this.awaitTurn(session, active);
+
+    return { runId };
+  }
+
+  private async buildSystemContext(
+    session: SessionState,
+  ): Promise<string | undefined> {
+    let skillsBlock = "";
+    if (session.enabledSkillIds.length > 0) {
+      skillsBlock = await this.skills.buildContextFor({
+        cwd: session.cwd,
+        enabledIds: session.enabledSkillIds,
+        onWarn: (msg) =>
+          this.notify(Method.Log, {
+            level: "warn",
+            message: msg,
+            target: "sidecar/skills",
+          }),
+      });
+    }
+    // Conversation-history workaround (SPEC-090..093). The current turn's
+    // user text is NOT included; it goes to the SDK as the fresh prompt.
+    const built = await this.context.buildContext(session.sessionId);
+    const parts: string[] = [];
+    if (skillsBlock.length > 0) parts.push(skillsBlock);
+    if (built.text.length > 0) parts.push(built.text);
+    if (parts.length === 0) return undefined;
+    return parts.join("\n\n");
+  }
+
+  private dispatchTurnEvent(
+    session: SessionState,
+    event: import("./sdkAdapter.js").TurnEvent,
+  ): void {
+    const active = session.activeRun;
+    if (!active) return;
+    switch (event.kind) {
+      case "text-delta":
+        if ((event.textKind ?? "assistant") === "assistant") {
+          active.assistantBuffer.push(event.delta);
+        }
+        this.notify(Method.StreamMessage, {
+          runId: active.runId,
+          delta: event.delta,
+          kind: event.textKind ?? "assistant",
+        });
+        return;
+      case "tool-call": {
+        active.toolCallInfo.set(event.callId, {
+          name: event.name,
+          argPreview: previewArgs(event.args),
+        });
+        this.notify(Method.StreamToolCall, {
+          runId: active.runId,
+          callId: event.callId,
+          name: event.name,
+          args: event.args,
+        });
+        // Policy decision. "always" cache short-circuits future prompts.
+        let decision = approvalPolicy({
+          mode: session.approvalMode,
+          toolName: event.name,
+          category: event.category,
+        });
+        if (
+          decision === "prompt" &&
+          session.alwaysApprovedTools.has(event.name)
+        ) {
+          decision = "auto-approve";
+        }
+        if (decision === "prompt") {
+          const requestId = `appr_${randomUUID()}`;
+          active.pendingApprovals.set(requestId, {
+            requestId,
+            resolve: (final: ApprovalDecision) => {
+              if (final === "always") {
+                session.alwaysApprovedTools.add(event.name);
+              }
+            },
+          });
+          this.notify(Method.ToolApprovalRequest, {
+            requestId,
+            runId: active.runId,
+            name: event.name,
+            args: event.args,
+            category: event.category,
+          });
+          // Observational path (SDK 1.0.23 exposes no beforeToolCall hook):
+          // emit the resolution *now* so the TUI can reconcile that the
+          // sidecar did not actually block the call.
+          this.notify(Method.ToolApprovalResult, {
+            requestId,
+            runId: active.runId,
+            name: event.name,
+            decision: "prompt",
+            observed: true,
+          });
+          this.emitObservationalWarnOnce(session);
+        }
+        return;
+      }
+      case "tool-result": {
+        const call = active.toolCallInfo.get(event.callId);
+        const name = call?.name ?? "tool";
+        const argPreview = call?.argPreview ?? "";
+        const bodyBits: string[] = [];
+        if (argPreview.length > 0) bodyBits.push(argPreview);
+        if (event.ok) {
+          if (event.outputPreview) bodyBits.push(event.outputPreview.slice(0, 200));
+        } else {
+          bodyBits.push(`error: ${event.error ?? "unknown"}`);
+        }
+        active.toolCallsSummary.push(
+          `${name} ${bodyBits.join(" — ").trim()}`.trim(),
+        );
+        this.notify(Method.StreamToolResult, {
+          runId: active.runId,
+          callId: event.callId,
+          ok: event.ok,
+          outputPreview: event.outputPreview,
+          error: event.error,
+        });
+        return;
+      }
+      case "usage":
+        active.turnUsage.observe(event.usage);
+        this.notify(Method.StreamUsage, {
+          runId: active.runId,
+          usage: event.usage,
+        });
+        return;
+      case "warning":
+        this.notify(Method.Log, {
+          level: "warn",
+          message: event.message,
+          target: "sidecar/agent",
+        });
+        return;
+    }
+  }
+
+  private async awaitTurn(
+    session: SessionState,
+    active: ActiveRunState,
+  ): Promise<void> {
+    try {
+      const result = await active.turn.wait();
+      // Cumulative usage: prefer the SDK's final `usage` snapshot; fall
+      // back to the accumulated per-event usage.
+      const finalUsage: TokenUsage =
+        result.usage ?? active.turnUsage.turnDelta();
+      const modelId = result.model ?? active.effectiveModel;
+      session.usage.add(finalUsage, modelId);
+      if (result.status === "error") {
+        this.notify(Method.RunError, {
+          runId: active.runId,
+          error: {
+            code: RpcErrorCode.AgentError,
+            message: result.errorMessage ?? "run failed",
+          },
+        });
+      }
+      if (modelId) session.currentModel = modelId;
+      // Record the completed turn onto the ConversationHistory *before*
+      // emitting `run/finished`, so any observer that reacts to that
+      // notification (tests, downstream consumers) can safely inspect the
+      // history and see the just-finished turn. On error we still record
+      // so users can retry with the failed turn's context intact.
+      const assistantText = active.assistantBuffer.join("");
+      this.context.recordTurn(session.sessionId, {
+        userPrompt: active.userPrompt,
+        assistantText,
+        toolCallsSummary: active.toolCallsSummary,
+        ...(modelId !== undefined ? { model: modelId } : {}),
+      });
+      this.notify(Method.RunFinished, {
+        runId: active.runId,
+        status: result.status,
+        usage: finalUsage,
+        model: modelId,
+        resultSummary: result.resultSummary,
+      });
+    } catch (err) {
+      this.notify(Method.RunError, {
+        runId: active.runId,
+        error: {
+          code: RpcErrorCode.AgentError,
+          message: (err as Error).message ?? "unknown run error",
+        },
+      });
+    } finally {
+      if (session.activeRun && session.activeRun.runId === active.runId) {
+        session.activeRun = null;
+      }
+    }
+  }
+
+  // -------- session/cancel ---------------------------------------------
+
+  async cancelRun(params: SessionCancelParams): Promise<Ok> {
+    const session = this.getSession(params.sessionId);
+    const active = session.activeRun;
+    if (!active || active.runId !== params.runId) {
+      // Nothing to cancel — treat as success (idempotent).
+      return { ok: true };
+    }
+    if (!active.turn.supportsCancel) {
+      this.notify(Method.Log, {
+        level: "warn",
+        message: `run ${active.runId} does not support cancel; letting it drain`,
+        target: "sidecar/session",
+      });
+    } else {
+      try {
+        await active.turn.cancel();
+      } catch (err) {
+        this.log("warn", `cancel() threw: ${(err as Error).message}`);
+      }
+    }
+    // Wait up to 3 s for the run to settle; if it does not, emit
+    // run/finished with status: "cancelled" ourselves.
+    const settled = await raceWithTimeout(
+      // Wait for `activeRun` to be cleared by awaitTurn().
+      new Promise<void>((resolve) => {
+        const check = () => {
+          if (!session.activeRun || session.activeRun.runId !== active.runId) {
+            resolve();
+          } else {
+            setTimeout(check, 25);
+          }
+        };
+        check();
+      }),
+      CANCEL_SETTLE_MS,
+    );
+    if (!settled) {
+      this.notify(Method.RunFinished, {
+        runId: active.runId,
+        status: "cancelled",
+        usage: session.usage.snapshot(),
+        model: active.effectiveModel,
+        resultSummary: "cancelled (sidecar-forced)",
+      });
+      // Detach so future turns can proceed. The underlying SDK handle is
+      // orphaned per spec §Concurrency.
+      if (session.activeRun && session.activeRun.runId === active.runId) {
+        session.activeRun = null;
+      }
+    }
+    return { ok: true };
+  }
+
+  // -------- session/resume ---------------------------------------------
+
+  async resumeSession(
+    params: SessionResumeParams,
+  ): Promise<SessionResumeResult> {
+    const apiKey = await this.requireApiKey();
+    const approvalMode = params.approvalMode ?? "suggest";
+    const composedMcp = await this.mcp.compose({
+      cwd: params.cwd,
+      inline: params.mcpOverrides,
+    });
+    try {
+      const agent = await this.adapter.resumeAgent(params.agentId, {
+        cwd: params.cwd,
+        approvalMode,
+        mcpOverrides: composedMcp,
+        apiKey,
+      });
+      const sessionId = `sess_${randomUUID()}`;
+      const state: SessionState = {
+        sessionId,
+        agent,
+        approvalMode,
+        usage: new UsageAccumulator(),
+        enabledSkillIds: params.enabledSkillIds ?? [],
+        mcpOverrides: params.mcpOverrides,
+        cwd: params.cwd,
+        defaultModel: agent.model,
+        currentModel: agent.model,
+        activeRun: null,
+        alwaysApprovedTools: new Set(),
+        enabledMcpServerIds: null,
+        observationalWarnEmitted: false,
+      };
+      this.sessions.set(sessionId, state);
+      this.context.registerSession(sessionId);
+      return { sessionId, model: agent.model };
+    } catch (err) {
+      throw this.wrapAgentError(err, "session/resume failed");
+    }
+  }
+
+  // -------- session/dispose --------------------------------------------
+
+  async disposeSession(params: SessionDisposeParams): Promise<Ok> {
+    const session = this.sessions.get(params.sessionId);
+    if (!session) return { ok: true };
+    this.sessions.delete(params.sessionId);
+    this.context.disposeSession(params.sessionId);
+    try {
+      await session.agent.dispose();
+    } catch (err) {
+      this.log("warn", `dispose() threw: ${(err as Error).message}`);
+    }
+    return { ok: true };
+  }
+
+  // -------- skills -----------------------------------------------------
+
+  async listSkills(params: SkillsListParams): Promise<SkillsListResult> {
+    const { skills, warnings } = await this.skills.list(params.cwd);
+    const out: SkillInfo[] = skills.map((s) => ({
+      id: s.id,
+      name: s.name,
+      description: s.description,
+      path: s.path,
+      sizeBytes: s.sizeBytes,
+      source: s.source,
+    }));
+    return { skills: out, warnings };
+  }
+
+  setSkillsEnabled(params: SkillsSetEnabledParams): Ok {
+    const session = this.getSession(params.sessionId);
+    session.enabledSkillIds = [...params.skillIds];
+    return { ok: true };
+  }
+
+  // -------- MCP --------------------------------------------------------
+
+  async listMcp(params: McpListParams): Promise<McpListResult> {
+    const session = this.getSession(params.sessionId);
+    const composed = await this.mcp.compose({
+      cwd: session.cwd,
+      inline: session.mcpOverrides,
+    });
+    const servers = await this.mcp.list({
+      composed,
+      enabledIds: session.enabledMcpServerIds,
+    });
+    return { servers };
+  }
+
+  toggleMcp(params: McpToggleParams): McpToggleResult {
+    const session = this.getSession(params.sessionId);
+    // Materialise the enabled set on first toggle. `null` means "all".
+    let ids = session.enabledMcpServerIds;
+    if (ids === null) {
+      // Best-effort: seed with the composed server ids so an explicit
+      // disable actually excludes something.
+      ids = new Set();
+      const composed = this.mcp.lastComposed();
+      if (composed) {
+        for (const id of Object.keys(composed)) ids.add(id);
+      }
+      session.enabledMcpServerIds = ids;
+    }
+    if (params.enabled) ids.add(params.serverId);
+    else ids.delete(params.serverId);
+    return { ok: true, pendingUntilNextTurn: true };
+  }
+
+  // -------- context/setStrategy ---------------------------------------
+
+  setContextStrategy(params: ContextSetStrategyParams): Ok {
+    // Validate the session exists so we surface a clean error.
+    this.getSession(params.sessionId);
+    this.context.setForcedStrategy(params.sessionId, params.strategy);
+    return { ok: true };
+  }
+
+  contextManager(): ContextManager {
+    return this.context;
+  }
+
+  // -------- session/setApprovalMode -----------------------------------
+
+  setApprovalMode(
+    params: SessionSetApprovalModeParams,
+  ): SessionSetApprovalModeResult {
+    const session = this.getSession(params.sessionId);
+    const wasFullAuto = session.approvalMode === "full-auto";
+    session.approvalMode = params.mode;
+    this.assertSandboxCoupling(params.mode);
+    const nowFullAuto = params.mode === "full-auto";
+    if (wasFullAuto !== nowFullAuto) {
+      // The SDK does not currently expose a live sandbox toggle: the
+      // sandboxOptions passed at Agent.create() are baked in for that
+      // agent handle. Document that limitation via a log line so the
+      // TUI can render a hint.
+      this.notify(Method.Log, {
+        level: "warn",
+        message:
+          "approval mode changed to " +
+          params.mode +
+          ": SDK cannot live-toggle sandbox on an existing agent; " +
+          "next session/create will apply the new sandbox setting.",
+        target: "sidecar/approval",
+      });
+    }
+    return { ok: true, liveSdkUpdate: false };
+  }
+
+  private emitObservationalWarnOnce(session: SessionState): void {
+    if (session.observationalWarnEmitted) return;
+    session.observationalWarnEmitted = true;
+    this.notify(Method.Log, {
+      level: "warn",
+      message:
+        "approval gating is observational until the SDK exposes a beforeToolCall hook",
+      target: "sidecar/approval",
+    });
+  }
+
+  // -------- tool/approvalResponse --------------------------------------
+
+  handleApprovalResponse(params: ToolApprovalResponseParams): Ok {
+    // Walk every session to find the pending request. In practice the TUI
+    // is 1:1 with a session, but the schema does not bind the response to a
+    // sessionId — we resolve by requestId only.
+    for (const session of this.sessions.values()) {
+      const active = session.activeRun;
+      if (!active) continue;
+      const pending = active.pendingApprovals.get(params.requestId);
+      if (pending) {
+        pending.resolve(params.decision);
+        active.pendingApprovals.delete(params.requestId);
+        return { ok: true };
+      }
+    }
+    // Unknown request id: treat as no-op so a stale response doesn't crash.
+    return { ok: true };
+  }
+
+  // -------- helpers -----------------------------------------------------
+
+  private assertSandboxCoupling(mode: ApprovalMode): void {
+    if (shouldEnableSandbox(mode)) {
+      this.log("info", "approval=full-auto → sandbox enabled");
+    }
+  }
+
+  private getSession(sessionId: string): SessionState {
+    const s = this.sessions.get(sessionId);
+    if (!s) {
+      throw new SessionRpcError(
+        RpcErrorCode.InvalidParams,
+        `unknown sessionId: ${sessionId}`,
+      );
+    }
+    return s;
+  }
+
+  private wrapAgentError(err: unknown, prefix: string): SessionRpcError {
+    const message =
+      err instanceof Error ? `${prefix}: ${err.message}` : `${prefix}`;
+    return new SessionRpcError(RpcErrorCode.AgentError, message);
+  }
+}
+
+function previewArgs(args: unknown): string {
+  if (args === undefined || args === null) return "";
+  try {
+    // Prefer human-friendly output for well-known shapes.
+    if (typeof args === "object" && !Array.isArray(args)) {
+      const rec = args as Record<string, unknown>;
+      if (typeof rec.path === "string") return rec.path;
+      if (typeof rec.command === "string") return rec.command;
+      if (typeof rec.file === "string") return rec.file;
+    }
+    return JSON.stringify(args).slice(0, 160);
+  } catch {
+    return String(args).slice(0, 160);
+  }
+}
+
+async function raceWithTimeout(
+  p: Promise<void>,
+  ms: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  const settled = p.then(() => true);
+  try {
+    return await Promise.race([settled, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}

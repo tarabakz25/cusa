@@ -1,0 +1,35 @@
+{
+  "name": "@cusa/sidecar",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Node.js sidecar hosting @cursor/sdk for cusa's Rust TUI",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "cusa-sidecar": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test 'src/**/*.test.ts'",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.23"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4",
+    "typescript": "^5.6"
+  }
+}

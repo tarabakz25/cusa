@@ -1,0 +1,115 @@
+# Copyright 2026 cusa contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Release matrix: build the Rust TUI + sidecar for every supported target,
+# upload artifacts to a GitHub Release, and (optionally) publish the npm
+# package. This file is intentionally commented-out for Slice 8 — merging
+# it in an active state would fire on the next tag push before the
+# maintainer is ready. Enable by:
+#   1. Reviewing the matrix + secrets below.
+#   2. Removing the `if: false` guards.
+#   3. Deleting these header comments.
+
+name: release
+
+on:
+  # push:
+  #   tags:
+  #     - "v*.*.*"
+  workflow_dispatch: {}
+
+jobs:
+  build-binary:
+    if: false # remove when ready
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: darwin-arm64
+            rust: aarch64-apple-darwin
+          - os: macos-13
+            target: darwin-x64
+            rust: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: linux-x64
+            rust: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: linux-arm64
+            rust: aarch64-unknown-linux-gnu
+          - os: windows-2022
+            target: win32-x64
+            rust: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+      - name: Build sidecar
+        working-directory: sidecar
+        run: |
+          npm ci
+          npm run build
+      - name: Build TUI
+        working-directory: tui
+        run: cargo build --release --target ${{ matrix.rust }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p npm/binaries/${{ matrix.target }}
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.rust }}/release/cusa-tui.exe \
+               npm/binaries/${{ matrix.target }}/cusa-tui.exe
+          else
+            cp target/${{ matrix.rust }}/release/cusa-tui \
+               npm/binaries/${{ matrix.target }}/cusa-tui
+          fi
+      - name: Pack tarball + checksum
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          exe="cusa-tui"
+          [ "${{ runner.os }}" = "Windows" ] && exe="cusa-tui.exe"
+          tar -czf dist/release/cusa-tui-${{ matrix.target }}.tar.gz \
+              -C npm/binaries/${{ matrix.target }} "$exe"
+          (cd dist/release && \
+             ( command -v sha256sum >/dev/null 2>&1 && sha256sum "cusa-tui-${{ matrix.target }}.tar.gz" || shasum -a 256 "cusa-tui-${{ matrix.target }}.tar.gz" ) \
+             > "cusa-tui-${{ matrix.target }}.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cusa-tui-${{ matrix.target }}
+          path: dist/release/*
+
+  publish-npm:
+    if: false # remove when ready
+    needs: build-binary
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+          merge-multiple: true
+      - name: Upload artifacts to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/release/* --clobber
+      - name: Publish npm package
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # The `postinstall` on end-user machines fetches from the release
+          # we just uploaded, so we do NOT bundle binaries in the tarball.
+          CUSA_ALLOW_EMPTY_BINARIES=1 npm publish --provenance --access public

@@ -1,0 +1,48 @@
+{
+  "name": "cusa",
+  "version": "0.0.1",
+  "description": "Cursor-SDK-powered coding CLI with transparent auto-mode",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "cusa": "bin/cusa.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "postinstall.js",
+    "sidecar",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node postinstall.js",
+    "prepack": "node ../scripts/prepack.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "keywords": [
+    "cli",
+    "cursor",
+    "coding-agent",
+    "ai",
+    "tui",
+    "codex"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cusa-cli/cusa"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

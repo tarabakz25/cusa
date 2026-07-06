@@ -1,0 +1,53 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# Root-level Node artifacts should not exist — this monorepo's Node packages
+# live under sidecar/ and npm/. Ignore accidental root manifests / lockfiles
+# created by tools running from the wrong cwd.
+/package.json
+/package-lock.json
+/pnpm-lock.yaml
+/yarn.lock
+/bun.lock
+/bun.lockb
+
+# Build output
+dist/
+build/
+out/
+
+# Rust
+target/
+**/*.rs.bk
+
+# npm packaging (populated by scripts/prepack.js / scripts/build-release.sh)
+npm/vendor/
+npm/binaries/
+npm/sidecar/
+npm/LICENSE
+npm/THIRD_PARTY_NOTICES.md
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+.cusa-local/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Test
+coverage/
