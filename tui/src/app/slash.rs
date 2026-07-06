@@ -161,6 +161,65 @@ pub fn help_entries() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// One row offered by the composer's slash-command suggestion popup
+/// (SPEC-002). `takes_args` controls whether Tab-completion appends a
+/// trailing space so the user can keep typing an argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandHint {
+    /// Canonical command name, without the leading slash.
+    pub name: &'static str,
+    /// One-line description rendered next to the name.
+    pub description: &'static str,
+    /// True when the command accepts an argument tail.
+    pub takes_args: bool,
+}
+
+/// Commands offered by the suggestion popup, in display order. Kept in sync
+/// with `parse` — see `spec_002_every_suggestion_parses_to_a_known_command`.
+const SUGGESTABLE: &[CommandHint] = &[
+    CommandHint { name: "help", description: "Show the command list.", takes_args: false },
+    CommandHint { name: "clear", description: "Clear the transcript, keep the session.", takes_args: false },
+    CommandHint { name: "reset", description: "Dispose the current session and start fresh.", takes_args: false },
+    CommandHint { name: "quit", description: "Exit cusa.", takes_args: false },
+    CommandHint { name: "model", description: "Pick a model or set one (<id|auto>).", takes_args: true },
+    CommandHint { name: "mode", description: "Change approval mode (alias for /approval).", takes_args: true },
+    CommandHint { name: "approval", description: "Cycle or pick the approval mode.", takes_args: true },
+    CommandHint { name: "skills", description: "Toggle skill injection.", takes_args: false },
+    CommandHint { name: "mcp", description: "Inspect / toggle MCP servers.", takes_args: false },
+    CommandHint { name: "cost", description: "Show per-turn cost + per-model aggregates.", takes_args: false },
+    CommandHint { name: "resume", description: "Resume a prior session.", takes_args: true },
+    CommandHint { name: "context", description: "Force history strategy (strategy=<auto|raw|summary>).", takes_args: true },
+];
+
+/// Extract the popup prefix from the composer buffer: the command token
+/// currently being typed. Returns `None` when the popup should stay
+/// hidden — the buffer does not start with `/`, or the user already typed
+/// whitespace after the name (arguments underway / multi-line input).
+pub fn popup_prefix(input: &str) -> Option<&str> {
+    let trimmed = input.trim_start();
+    let rest = trimmed.strip_prefix('/')?;
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Case-insensitive prefix filter over the suggestable commands. An exact
+/// name match sorts first so Enter never fires a longer sibling (e.g.
+/// typing `/mode` must not run `/model`).
+pub fn suggestions(prefix: &str) -> Vec<CommandHint> {
+    let needle = prefix.to_ascii_lowercase();
+    let mut out: Vec<CommandHint> = SUGGESTABLE
+        .iter()
+        .copied()
+        .filter(|c| c.name.starts_with(needle.as_str()))
+        .collect();
+    // `false < true`, and the sort is stable: the exact match (if any)
+    // moves to the front, everything else keeps display order.
+    out.sort_by_key(|c| c.name != needle);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +335,47 @@ mod tests {
             "/mcp",
         ] {
             assert!(names.iter().any(|n| **n == expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn spec_002_popup_prefix_extraction() {
+        assert_eq!(popup_prefix("/"), Some(""));
+        assert_eq!(popup_prefix("/mo"), Some("mo"));
+        assert_eq!(popup_prefix("  /mo"), Some("mo"));
+        assert_eq!(popup_prefix("hello"), None);
+        assert_eq!(popup_prefix(""), None);
+        // Arguments underway or multi-line input hide the popup.
+        assert_eq!(popup_prefix("/model auto"), None);
+        assert_eq!(popup_prefix("/mo\nde"), None);
+    }
+
+    #[test]
+    fn spec_002_suggestions_filter_by_prefix() {
+        assert_eq!(suggestions("").len(), 12);
+        let mo: Vec<&str> = suggestions("mo").iter().map(|c| c.name).collect();
+        assert_eq!(mo, vec!["model", "mode"]);
+        assert!(suggestions("zzz").is_empty());
+        assert_eq!(suggestions("HEL")[0].name, "help", "prefix match is case-insensitive");
+    }
+
+    #[test]
+    fn spec_002_suggestions_exact_match_sorts_first() {
+        // "/mode" matches both "mode" and "model"; the exact one must come
+        // first so Enter runs what the user typed.
+        let mode: Vec<&str> = suggestions("mode").iter().map(|c| c.name).collect();
+        assert_eq!(mode, vec!["mode", "model"]);
+    }
+
+    #[test]
+    fn spec_002_every_suggestion_parses_to_a_known_command() {
+        for hint in suggestions("") {
+            let parsed = parse(&format!("/{}", hint.name)).expect("parses");
+            assert!(
+                !matches!(parsed, SlashCommand::Unknown(_)),
+                "/{} must be a known command",
+                hint.name
+            );
         }
     }
 }

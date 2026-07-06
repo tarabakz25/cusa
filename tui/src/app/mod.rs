@@ -390,6 +390,13 @@ pub fn handle_key(
     // Reset any Ctrl-C hint on the first non-Ctrl-C key.
     state.footer_override = None;
 
+    // SPEC-002: while the slash-command suggestion popup is visible,
+    // Up/Down/Tab/Enter/Esc are routed to it (Tab completes instead of
+    // cycling the approval mode).
+    if let Some(outcome) = handle_slash_popup_key(state, client, code, mods) {
+        return outcome;
+    }
+
     // SPEC-021: Tab cycles the approval mode when no overlay is open.
     // The new mode is reflected in the status line immediately; the
     // footer hint updates on the next draw, so we intentionally skip the
@@ -403,10 +410,76 @@ pub fn handle_key(
         return KeyOutcome::Handled;
     }
 
-    match handle_composer_key(state, code, mods) {
+    let input_before = state.input.clone();
+    let result = handle_composer_key(state, code, mods);
+    if state.input != input_before {
+        // Any edit re-arms an Esc-dismissed popup and resets the selection
+        // so filtering starts from the top again (SPEC-002).
+        state.slash_popup_dismissed = false;
+        state.slash_popup_selected = 0;
+    }
+    match result {
         ComposerKeyResult::Submit => submit_input(state, client),
         ComposerKeyResult::Handled => KeyOutcome::Handled,
     }
+}
+
+/// Intercept a key while the slash-command suggestion popup is visible
+/// (SPEC-002). Returns `Some(outcome)` when the popup consumed the key;
+/// `None` lets the caller fall through to the composer.
+fn handle_slash_popup_key(
+    state: &mut AppState,
+    client: &SidecarClient,
+    code: KeyCode,
+    mods: KeyModifiers,
+) -> Option<KeyOutcome> {
+    let suggestions = state.slash_suggestions();
+    if suggestions.is_empty() {
+        return None;
+    }
+    let len = suggestions.len();
+    if state.slash_popup_selected >= len {
+        state.slash_popup_selected = len - 1;
+    }
+    match code {
+        KeyCode::Up => {
+            state.slash_popup_selected = state.slash_popup_selected.saturating_sub(1);
+            Some(KeyOutcome::Handled)
+        }
+        KeyCode::Down => {
+            state.slash_popup_selected = (state.slash_popup_selected + 1).min(len - 1);
+            Some(KeyOutcome::Handled)
+        }
+        KeyCode::Tab => {
+            complete_slash_suggestion(state, suggestions[state.slash_popup_selected]);
+            Some(KeyOutcome::Handled)
+        }
+        KeyCode::Enter if !mods.contains(KeyModifiers::SHIFT) => {
+            let hint = suggestions[state.slash_popup_selected];
+            state.input = format!("/{}", hint.name);
+            state.cursor_pos = text_char_count(&state.input);
+            state.slash_popup_selected = 0;
+            Some(submit_input(state, client))
+        }
+        KeyCode::Esc => {
+            state.slash_popup_dismissed = true;
+            Some(KeyOutcome::Handled)
+        }
+        _ => None,
+    }
+}
+
+/// Replace the buffer with the completed command name. Arg-taking commands
+/// get a trailing space so the user can keep typing the argument (which
+/// also hides the popup — whitespace means "arguments underway").
+fn complete_slash_suggestion(state: &mut AppState, hint: crate::app::slash::CommandHint) {
+    state.input = if hint.takes_args {
+        format!("/{} ", hint.name)
+    } else {
+        format!("/{}", hint.name)
+    };
+    state.cursor_pos = text_char_count(&state.input);
+    state.slash_popup_selected = 0;
 }
 
 fn handle_overlay_key(state: &mut AppState, client: &SidecarClient, code: KeyCode) -> KeyOutcome {
@@ -1593,5 +1666,121 @@ mod tests {
         let _ = SkillsOverlay::loading();
         let _ = McpOverlay::loading();
         let _ = ModelPickerOverlay::loading();
+    }
+
+    // ------------------------------------------------------------------
+    // SPEC-002 — slash-command suggestion popup
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spec_002_typing_slash_shows_suggestions_and_filters() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        handle_key(&mut state, &client, KeyCode::Char('/'), KeyModifiers::empty());
+        assert_eq!(state.slash_suggestions().len(), 12, "bare / lists every command");
+        handle_key(&mut state, &client, KeyCode::Char('m'), KeyModifiers::empty());
+        handle_key(&mut state, &client, KeyCode::Char('o'), KeyModifiers::empty());
+        let names: Vec<&str> = state.slash_suggestions().iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["model", "mode"]);
+
+        let mut plain = AppState::new("/tmp".into());
+        handle_key(&mut plain, &client, KeyCode::Char('h'), KeyModifiers::empty());
+        assert!(plain.slash_suggestions().is_empty(), "no popup for plain prompts");
+    }
+
+    #[tokio::test]
+    async fn spec_002_popup_enter_runs_selected_command() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        for c in ['/', 'h', 'e', 'l'] {
+            handle_key(&mut state, &client, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        handle_key(&mut state, &client, KeyCode::Enter, KeyModifiers::empty());
+        assert!(matches!(state.overlay, Overlay::Help), "Enter on /hel must run /help");
+        assert!(state.input.is_empty(), "buffer cleared after dispatch");
+    }
+
+    #[tokio::test]
+    async fn spec_002_popup_exact_match_wins_over_longer_sibling() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        for c in ['/', 'm', 'o', 'd', 'e'] {
+            handle_key(&mut state, &client, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        handle_key(&mut state, &client, KeyCode::Enter, KeyModifiers::empty());
+        assert!(
+            matches!(state.overlay, Overlay::ApprovalPicker(_)),
+            "typing /mode + Enter must run /mode (approval picker), not /model"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_002_popup_down_selects_second_row_for_enter() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        for c in ['/', 'm', 'o'] {
+            handle_key(&mut state, &client, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        // Rows: [model, mode] — Down selects "mode".
+        handle_key(&mut state, &client, KeyCode::Down, KeyModifiers::empty());
+        assert_eq!(state.slash_popup_selected, 1);
+        handle_key(&mut state, &client, KeyCode::Enter, KeyModifiers::empty());
+        assert!(matches!(state.overlay, Overlay::ApprovalPicker(_)));
+    }
+
+    #[tokio::test]
+    async fn spec_002_popup_tab_completes_without_submitting() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        for c in ['/', 's', 'k'] {
+            handle_key(&mut state, &client, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        handle_key(&mut state, &client, KeyCode::Tab, KeyModifiers::empty());
+        assert_eq!(state.input, "/skills", "no trailing space for arg-less commands");
+        assert!(!state.overlay.is_open(), "Tab must not dispatch");
+
+        let mut args = AppState::new("/tmp".into());
+        for c in ['/', 'm', 'o', 'd'] {
+            handle_key(&mut args, &client, KeyCode::Char(c), KeyModifiers::empty());
+        }
+        handle_key(&mut args, &client, KeyCode::Tab, KeyModifiers::empty());
+        assert_eq!(args.input, "/model ", "arg-taking commands complete with a space");
+        assert!(args.slash_suggestions().is_empty(), "popup hides once args begin");
+    }
+
+    #[tokio::test]
+    async fn spec_002_popup_esc_dismisses_and_edit_rearms() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        handle_key(&mut state, &client, KeyCode::Char('/'), KeyModifiers::empty());
+        assert!(!state.slash_suggestions().is_empty());
+        handle_key(&mut state, &client, KeyCode::Esc, KeyModifiers::empty());
+        assert!(state.slash_suggestions().is_empty(), "Esc hides the popup");
+        assert_eq!(state.input, "/", "Esc keeps the buffer");
+        handle_key(&mut state, &client, KeyCode::Char('m'), KeyModifiers::empty());
+        assert!(
+            !state.slash_suggestions().is_empty(),
+            "the next edit re-arms the popup"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_021_tab_cycles_approval_only_without_popup() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        assert_eq!(state.session.approval_mode, ApprovalMode::Suggest);
+        handle_key(&mut state, &client, KeyCode::Tab, KeyModifiers::empty());
+        assert_ne!(
+            state.session.approval_mode,
+            ApprovalMode::Suggest,
+            "Tab still cycles approval when no popup is visible"
+        );
+
+        let mut popup = AppState::new("/tmp".into());
+        let before = popup.session.approval_mode;
+        handle_key(&mut popup, &client, KeyCode::Char('/'), KeyModifiers::empty());
+        handle_key(&mut popup, &client, KeyCode::Tab, KeyModifiers::empty());
+        assert_eq!(popup.session.approval_mode, before, "popup Tab must not cycle");
+        assert_eq!(popup.input, "/help", "popup Tab completes the selection");
     }
 }
