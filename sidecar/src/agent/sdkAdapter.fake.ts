@@ -42,6 +42,8 @@ export type TurnScript = {
 
 export interface FakeAdapterState {
   models: ModelInfo[];
+  /** API keys passed to `listModels`, in call order. */
+  listModelsKeys: string[];
   nextAgentId: number;
   nextRunId: number;
   createCalls: CreateAgentOptions[];
@@ -62,6 +64,7 @@ export class FakeSdkAdapter implements SdkAdapter {
       { id: "composer-2.5", displayName: "Composer 2.5" },
       { id: "claude-sonnet-4", displayName: "Claude Sonnet 4" },
     ],
+    listModelsKeys: [],
     nextAgentId: 1,
     nextRunId: 1,
     createCalls: [],
@@ -80,7 +83,8 @@ export class FakeSdkAdapter implements SdkAdapter {
     this.scripts.push(...s);
   }
 
-  async listModels(): Promise<ModelInfo[]> {
+  async listModels(apiKey: string): Promise<ModelInfo[]> {
+    this.state.listModelsKeys.push(apiKey);
     return this.state.models;
   }
 

@@ -83,6 +83,41 @@ test("SPEC-100: api key never appears in any emitted RPC frame", async () => {
 });
 
 // ----------------------------------------------------------------------
+// SPEC-016 — models/list
+// ----------------------------------------------------------------------
+
+test("SPEC-016: models/list forwards the resolved api key to the SDK adapter", async () => {
+  // The Cursor SDK falls back to process.env.CURSOR_API_KEY when no key is
+  // passed, which breaks keys resolved from ~/.cusa/config.toml. The manager
+  // must hand the resolved key to the adapter explicitly.
+  const { mgr, adapter } = newHarness({ apiKey: "sk_from_config_toml" });
+  const result = await mgr.listModels();
+  assert.equal(result.models.length, 2);
+  assert.deepEqual(adapter.state.listModelsKeys, ["sk_from_config_toml"]);
+});
+
+test("SPEC-016: models/list rejects with NO_API_KEY and caches on success", async () => {
+  const missing = newHarness({ apiKey: null });
+  await assert.rejects(
+    () => missing.mgr.listModels(),
+    (err: unknown) => {
+      assert.ok(err instanceof SessionRpcError);
+      assert.equal((err as SessionRpcError).code, RpcErrorCode.NoApiKey);
+      return true;
+    },
+  );
+
+  const ok = newHarness();
+  await ok.mgr.listModels();
+  await ok.mgr.listModels();
+  assert.equal(
+    ok.adapter.state.listModelsKeys.length,
+    1,
+    "second call must be served from the cache",
+  );
+});
+
+// ----------------------------------------------------------------------
 // SPEC-001
 // ----------------------------------------------------------------------
 

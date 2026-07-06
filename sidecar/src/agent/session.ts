@@ -177,10 +177,12 @@ export class SessionManager {
 
   async listModels(): Promise<{ models: ModelInfo[] }> {
     if (this.modelsCache) return { models: this.modelsCache };
-    // Trigger key resolution so we surface NO_API_KEY cleanly.
-    await this.requireApiKey();
+    // Resolve the key here (env or ~/.cusa/config.toml) and hand it to the
+    // adapter explicitly. Relying on the SDK's env-var fallback breaks the
+    // config-file path and surfaces as "models/list failed" (SPEC-016).
+    const apiKey = await this.requireApiKey();
     try {
-      const models = await this.adapter.listModels();
+      const models = await this.adapter.listModels(apiKey);
       this.modelsCache = models;
       return { models };
     } catch (err) {
