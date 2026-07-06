@@ -483,4 +483,14 @@ mod tests {
             .any(|e| matches!(e, TranscriptEntry::TurnSummary { .. }));
         assert!(has_summary, "expected a turn summary in transcript");
     }
+
+    #[test]
+    fn spec_001_begin_user_turn_records_start_time() {
+        let mut s = AppState::new("/x".into());
+        s.begin_user_turn("hi".into());
+        assert!(
+            s.current_turn.as_ref().unwrap().started_at.is_some(),
+            "started_at drives the activity indicator's elapsed readout"
+        );
+    }
 }

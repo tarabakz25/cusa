@@ -911,6 +911,17 @@ pub enum KeyOutcome {
     Quit,
 }
 
+/// Redraw cadence for the event loops: fast while a run is in flight so
+/// the activity spinner animates and the elapsed-seconds readout ticks;
+/// slow when idle (only toast expiry needs it).
+fn ui_tick_interval(state: &AppState) -> std::time::Duration {
+    if state.phase == RunPhase::Idle {
+        std::time::Duration::from_millis(500)
+    } else {
+        std::time::Duration::from_millis(100)
+    }
+}
+
 /// The main event loop. Owns the terminal and drives it until quit.
 pub async fn run_event_loop(
     state: &mut AppState,
@@ -992,6 +1003,9 @@ async fn run_interactive_loop(
                     None => break,
                 }
             }
+            // Periodic tick: animates the activity indicator and expires
+            // toasts even when no input / sidecar events arrive.
+            _ = tokio::time::sleep(ui_tick_interval(state)) => {}
         }
         // Toast auto-expiry: 2.5 seconds.
         if let Overlay::Toast { created, .. } = state.overlay {
@@ -1045,6 +1059,8 @@ async fn run_loop<B: Backend>(
                     None => break,
                 }
             }
+            // Periodic tick — see `ui_tick_interval`.
+            _ = tokio::time::sleep(ui_tick_interval(state)) => {}
         }
         // Toast auto-expiry: 2.5 seconds.
         if let Overlay::Toast { created, .. } = state.overlay {

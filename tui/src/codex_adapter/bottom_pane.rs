@@ -6,7 +6,7 @@
 // above the composer.
 
 use crate::app::slash::CommandHint;
-use crate::app::state::AppState;
+use crate::app::state::{AppState, RunPhase};
 use crate::codex_adapter::composer::ComposerWidget;
 use crate::codex_adapter::welcome::composer_footer_line;
 use crate::codex_ui::ui_consts::FOOTER_INDENT_COLS;
@@ -18,6 +18,14 @@ use ratatui::widgets::{Paragraph, Widget};
 
 const FOOTER_ROW_HEIGHT: u16 = 1;
 
+/// Braille spinner frames for the activity indicator; one frame per
+/// 100 ms of turn elapsed time (redraws are driven by the event-loop
+/// tick in `app::run_interactive_loop`).
+const SPINNER_FRAMES: [&str; 10] = [
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}",
+    "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}",
+];
+
 /// Maximum rendered suggestion rows; the window scrolls so the selected
 /// row stays visible (SPEC-002).
 pub const MAX_POPUP_ROWS: usize = 8;
@@ -28,6 +36,7 @@ pub struct BottomPaneWidget {
     composer: ComposerWidget,
     footer: Line<'static>,
     popup: Vec<Line<'static>>,
+    activity: Option<Line<'static>>,
 }
 
 impl BottomPaneWidget {
@@ -36,7 +45,15 @@ impl BottomPaneWidget {
             composer: ComposerWidget::from_state(state),
             footer: composer_footer_line(&state.session),
             popup: popup_lines(state),
+            activity: activity_line(state),
         }
+    }
+
+    /// Rows the activity indicator occupies for this state (1 while a run
+    /// is in flight or cancelling, 0 when idle). Also used by the composer
+    /// to offset IME cursor placement.
+    pub fn activity_rows(state: &AppState) -> u16 {
+        if state.phase == RunPhase::Idle { 0 } else { 1 }
     }
 
     /// Rows the slash-command suggestion popup occupies for this state.
@@ -45,10 +62,40 @@ impl BottomPaneWidget {
     }
 
     pub fn desired_height(state: &AppState, width: u16) -> u16 {
-        ComposerWidget::desired_height_for_state(state, width)
+        Self::activity_rows(state)
+            + ComposerWidget::desired_height_for_state(state, width)
             + Self::popup_rows(state)
             + FOOTER_ROW_HEIGHT
     }
+}
+
+/// Activity indicator rendered above the composer while a run is in
+/// flight: `\u{2839} Working \u{b7} 3s \u{b7} Ctrl-C to interrupt` (SPEC-001/004).
+fn activity_line(state: &AppState) -> Option<Line<'static>> {
+    let label = match state.phase {
+        RunPhase::Idle => return None,
+        RunPhase::Routing => "Routing",
+        RunPhase::Streaming => "Working",
+        RunPhase::AwaitingApproval => "Waiting for approval",
+        RunPhase::Cancelling => "Cancelling",
+    };
+    let elapsed_ms = state
+        .current_turn
+        .as_ref()
+        .and_then(|t| t.started_at)
+        .map(|s| s.elapsed().as_millis())
+        .unwrap_or(0);
+    let frame = SPINNER_FRAMES[(elapsed_ms / 100) as usize % SPINNER_FRAMES.len()];
+    Some(Line::from(vec![
+        Span::styled(frame.to_string(), Style::default().fg(Color::Magenta)),
+        Span::from(" "),
+        Span::from(label.to_string()).bold(),
+        Span::from(format!(
+            " \u{b7} {}s \u{b7} Ctrl-C to interrupt",
+            elapsed_ms / 1000
+        ))
+        .dim(),
+    ]))
 }
 
 /// Build the popup lines — `› /name  description` — windowed around the
@@ -98,14 +145,30 @@ impl Widget for BottomPaneWidget {
             return;
         }
         let popup_height = (self.popup.len() as u16).min(area.height);
-        let [popup_rect, composer_rect, footer_rect] = Layout::default()
+        let activity_height = u16::from(self.activity.is_some()).min(area.height);
+        // Top to bottom: activity status, suggestion popup (adjacent to the
+        // input it filters), composer, footer.
+        let [activity_rect, popup_rect, composer_rect, footer_rect] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(activity_height),
                 Constraint::Length(popup_height),
                 Constraint::Min(1),
                 Constraint::Length(FOOTER_ROW_HEIGHT.min(area.height)),
             ])
             .areas(area);
+
+        if let Some(line) = self.activity {
+            if activity_rect.height > 0 && activity_rect.width > FOOTER_INDENT_COLS as u16 {
+                let indented = Rect {
+                    x: activity_rect.x.saturating_add(FOOTER_INDENT_COLS as u16),
+                    y: activity_rect.y,
+                    width: activity_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16),
+                    height: activity_rect.height,
+                };
+                Paragraph::new(line).render(indented, buf);
+            }
+        }
 
         self.composer.render_composer_surface(composer_rect, buf);
 
@@ -141,7 +204,7 @@ impl Widget for BottomPaneWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::state::AppState;
+    use crate::app::state::{AppState, RunPhase};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -254,5 +317,63 @@ mod tests {
         state.input = "/mo".into();
         state.overlay = crate::app::overlay::Overlay::Help;
         assert_eq!(BottomPaneWidget::popup_rows(&state), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // SPEC-001/004 — activity indicator
+    // ------------------------------------------------------------------
+
+    fn streaming_state() -> AppState {
+        let mut state = AppState::new("/tmp".into());
+        state.begin_user_turn("explain this".into());
+        state.on_router_decision(
+            "composer-2.5".into(),
+            "rule".into(),
+            "run-1".into(),
+            cusa_rpc::RouterSource::Rule,
+        );
+        state
+    }
+
+    #[test]
+    fn spec_001_streaming_shows_activity_indicator() {
+        let state = streaming_state();
+        assert_eq!(state.phase, RunPhase::Streaming);
+        let out = render_to_string(&state, 100, 10);
+        assert!(out.contains("Working"), "streaming must show Working: {out}");
+        assert!(
+            out.contains("Ctrl-C to interrupt"),
+            "interrupt hint missing: {out}"
+        );
+    }
+
+    #[test]
+    fn spec_001_idle_has_no_activity_indicator() {
+        let state = AppState::new("/tmp".into());
+        let out = render_to_string(&state, 100, 10);
+        assert!(!out.contains("Working"), "idle must not show Working: {out}");
+        assert!(!out.contains("Ctrl-C to interrupt"), "{out}");
+        assert_eq!(BottomPaneWidget::activity_rows(&state), 0);
+    }
+
+    #[test]
+    fn spec_001_phase_labels_cover_all_active_states() {
+        let mut state = streaming_state();
+        state.phase = RunPhase::Routing;
+        assert!(render_to_string(&state, 100, 10).contains("Routing"));
+        state.phase = RunPhase::AwaitingApproval;
+        assert!(render_to_string(&state, 100, 10).contains("Waiting for approval"));
+        state.phase = RunPhase::Cancelling;
+        assert!(render_to_string(&state, 100, 10).contains("Cancelling"));
+    }
+
+    #[test]
+    fn spec_001_activity_row_grows_desired_height() {
+        let idle = AppState::new("/tmp".into());
+        let streaming = streaming_state();
+        assert_eq!(
+            BottomPaneWidget::desired_height(&streaming, 80),
+            BottomPaneWidget::desired_height(&idle, 80) + 1
+        );
     }
 }
