@@ -531,6 +531,9 @@ fn render_model_picker(m: &ModelPickerOverlay, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(rect);
     block.render(rect, buf);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Replaces the blank spacer row with a scroll-position indicator when
+    // the list overflows the visible window, keeping total rows constant.
+    let mut spacer = Line::from("");
     if m.loading {
         lines.push(Line::from(Span::styled(
             "loading models…",
@@ -547,7 +550,21 @@ fn render_model_picker(m: &ModelPickerOverlay, area: Rect, buf: &mut Buffer) {
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        for (i, model) in m.models.iter().enumerate() {
+        // Scroll window: the hint block below takes 2 rows of `inner`;
+        // window the list around the cursor so it never clips off the
+        // bottom of the overlay when there are more models than rows.
+        let visible = (inner.height as usize).saturating_sub(2).max(1);
+        let cursor = m.cursor.min(m.models.len().saturating_sub(1));
+        let start = (cursor + 1).saturating_sub(visible);
+        let more_above = start > 0;
+        let more_below = start + visible < m.models.len();
+        for (i, model) in m
+            .models
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+        {
             let selected = i == m.cursor;
             let marker = if selected { "› " } else { "  " };
             let mut spans = vec![Span::styled(
@@ -569,8 +586,21 @@ fn render_model_picker(m: &ModelPickerOverlay, area: Rect, buf: &mut Buffer) {
             }
             lines.push(Line::from(spans));
         }
+        if more_above || more_below {
+            let mut hint = format!("{}/{}", cursor + 1, m.models.len());
+            if more_above {
+                hint.push_str(" · ↑ more");
+            }
+            if more_below {
+                hint.push_str(" · ↓ more");
+            }
+            spacer = Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
-    lines.push(Line::from(""));
+    lines.push(spacer);
     lines.push(Line::from(Span::styled(
         "↑/↓ select · Enter apply · Esc cancel",
         Style::default().fg(Color::Cyan),
@@ -1114,6 +1144,53 @@ mod tests {
         assert!(out.contains("composer-2.5"));
         assert!(out.contains("claude-sonnet-4"));
         assert!(out.contains("↑/↓ select"));
+    }
+
+    #[test]
+    fn spec_016_model_picker_scrolls_cursor_into_view_on_long_lists() {
+        // 24 models: the 16-row overlay (14 inner − 2 hint rows = 12
+        // visible) cannot fit them all. Before the scroll-window fix the
+        // list rendered from the top and the cursor clipped off-screen.
+        let models: Vec<ModelInfo> = (0..24)
+            .map(|i| ModelInfo {
+                id: format!("model-{i:02}"),
+                display_name: None,
+                provider: None,
+                supports_thinking: false,
+            })
+            .collect();
+        let mut picker = ModelPickerOverlay::populated(models);
+        for _ in 0..23 {
+            picker.move_down();
+        }
+        assert_eq!(picker.cursor, 23);
+        let out = render(&Overlay::ModelPicker(picker), 80, 24);
+        assert!(
+            out.contains("› model-23"),
+            "cursor row must be visible after scrolling to the bottom: {out}"
+        );
+        assert!(
+            !out.contains("model-00"),
+            "top of the list must scroll out of view: {out}"
+        );
+        assert!(out.contains("24/24"), "scroll indicator missing: {out}");
+        assert!(out.contains("↑ more"), "up-scroll hint missing: {out}");
+    }
+
+    #[test]
+    fn spec_016_model_picker_short_list_needs_no_scroll_indicator() {
+        let models: Vec<ModelInfo> = (0..3)
+            .map(|i| ModelInfo {
+                id: format!("model-{i}"),
+                display_name: None,
+                provider: None,
+                supports_thinking: false,
+            })
+            .collect();
+        let out = render(&Overlay::ModelPicker(ModelPickerOverlay::populated(models)), 80, 24);
+        assert!(out.contains("model-0"));
+        assert!(out.contains("model-2"));
+        assert!(!out.contains("more"), "no indicator for short lists: {out}");
     }
 
     #[test]
