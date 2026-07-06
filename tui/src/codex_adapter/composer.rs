@@ -92,7 +92,12 @@ impl ComposerWidget {
             return None;
         }
         let bottom = composer_bottom_rect(screen, state)?;
-        let composer_area = Self::composer_area_in_bottom_pane(bottom);
+        let mut composer_area = Self::composer_area_in_bottom_pane(bottom);
+        // The slash-command suggestion popup renders above the composer
+        // inside the bottom pane; shift the IME cursor down accordingly.
+        let popup_rows = crate::codex_adapter::bottom_pane::BottomPaneWidget::popup_rows(state);
+        composer_area.y = composer_area.y.saturating_add(popup_rows);
+        composer_area.height = composer_area.height.saturating_sub(popup_rows);
         let textarea_rect = Self::textarea_rect(composer_area);
         if textarea_rect.is_empty() {
             return None;
@@ -320,6 +325,33 @@ mod tests {
         let bottom = composer_bottom_rect(screen, &state).unwrap();
         let textarea = ComposerWidget::textarea_rect(ComposerWidget::composer_area_in_bottom_pane(bottom));
         assert_eq!((x, y), (textarea.x, textarea.y));
+    }
+
+    #[test]
+    fn spec_002_ime_cursor_row_unchanged_when_popup_open() {
+        // The popup renders above the composer and the bottom pane grows
+        // upward, so the composer (and IME cursor) row on screen must not
+        // move when suggestions appear.
+        let screen = Rect::new(0, 0, 80, 24);
+
+        let mut plain = AppState::new("/tmp".into());
+        plain.input = "x".into();
+        plain.cursor_pos = 1;
+        let (_, y_plain) = ComposerWidget::terminal_cursor(&plain, screen).expect("cursor");
+
+        let mut slash = AppState::new("/tmp".into());
+        slash.input = "/".into();
+        slash.cursor_pos = 1;
+        assert!(
+            !slash.slash_suggestions().is_empty(),
+            "slash input must produce suggestions"
+        );
+        let (_, y_slash) = ComposerWidget::terminal_cursor(&slash, screen).expect("cursor");
+
+        assert_eq!(
+            y_plain, y_slash,
+            "composer cursor row must not move when the popup opens above it"
+        );
     }
 
     #[test]

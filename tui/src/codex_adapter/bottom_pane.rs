@@ -3,7 +3,7 @@
 //
 // Codex-style bottom pane: tinted composer + status row (ChatComposer
 // layout), plus the slash-command suggestion popup (SPEC-002) rendered
-// between the composer and the footer.
+// above the composer.
 
 use crate::app::slash::CommandHint;
 use crate::app::state::AppState;
@@ -96,11 +96,11 @@ impl Widget for BottomPaneWidget {
             return;
         }
         let popup_height = (self.popup.len() as u16).min(area.height);
-        let [composer_rect, popup_rect, footer_rect] = Layout::default()
+        let [popup_rect, composer_rect, footer_rect] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1),
                 Constraint::Length(popup_height),
+                Constraint::Min(1),
                 Constraint::Length(FOOTER_ROW_HEIGHT.min(area.height)),
             ])
             .areas(area);
@@ -167,6 +167,45 @@ mod tests {
         assert!(out.contains("/model"), "popup must list /model: {out}");
         assert!(out.contains("/mode"), "popup must list /mode: {out}");
         assert!(out.contains("\u{203a}"), "selected row marker missing: {out}");
+    }
+
+    fn render_rows(state: &AppState, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(BottomPaneWidget::from_state(state), f.area()))
+            .unwrap();
+        let symbols: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        symbols
+            .chunks(width as usize)
+            .map(|row| row.concat())
+            .collect()
+    }
+
+    #[test]
+    fn spec_002_popup_renders_above_composer() {
+        let mut state = AppState::new("/tmp".into());
+        state.input = "/mo".into();
+        state.cursor_pos = 3;
+        let rows = render_rows(&state, 100, 10);
+        let popup_row = rows
+            .iter()
+            .position(|r| r.contains("/model"))
+            .expect("popup row with /model");
+        let composer_row = rows
+            .iter()
+            .position(|r| r.contains("/mo") && !r.contains("/model") && !r.contains("/mode"))
+            .expect("composer row with raw input");
+        assert!(
+            popup_row < composer_row,
+            "popup must render above the composer (popup row {popup_row}, composer row {composer_row}): {rows:?}"
+        );
     }
 
     #[test]
