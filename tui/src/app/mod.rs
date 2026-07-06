@@ -62,6 +62,7 @@ pub fn compute_layout(area: Rect, state: &AppState) -> [Rect; 2] {
 trait RenderFrame {
     fn area(&self) -> Rect;
     fn render_widget<W: Widget>(&mut self, widget: W, area: Rect);
+    fn place_composer_cursor(&mut self, pos: Option<(u16, u16)>);
 }
 
 impl RenderFrame for ratatui::Frame<'_> {
@@ -72,6 +73,8 @@ impl RenderFrame for ratatui::Frame<'_> {
     fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
         widget.render(area, self.buffer_mut());
     }
+
+    fn place_composer_cursor(&mut self, _pos: Option<(u16, u16)>) {}
 }
 
 impl RenderFrame for crate::codex_ui::custom_terminal::Frame<'_> {
@@ -81,6 +84,12 @@ impl RenderFrame for crate::codex_ui::custom_terminal::Frame<'_> {
 
     fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
         widget.render(area, self.buffer_mut());
+    }
+
+    fn place_composer_cursor(&mut self, pos: Option<(u16, u16)>) {
+        if let Some((x, y)) = pos {
+            self.set_cursor_position((x, y));
+        }
     }
 }
 
@@ -99,6 +108,12 @@ fn render_app_ui<F: RenderFrame>(state: &AppState, frame: &mut F) {
     frame.render_widget(BottomPaneWidget::from_state(state), bottom);
     if state.overlay.is_open() {
         frame.render_widget(OverlayWidget::new(&state.overlay), frame.area());
+    } else {
+        let cursor = crate::codex_adapter::composer::ComposerWidget::terminal_cursor(
+            state,
+            frame.area(),
+        );
+        frame.place_composer_cursor(cursor);
     }
 }
 
@@ -567,6 +582,7 @@ fn submit_input(state: &mut AppState, client: &SidecarClient) -> KeyOutcome {
     }
     state.input.clear();
     state.cursor_pos = 0;
+    state.composer_input_active = false;
 
     if let Some(cmd) = slash::parse(&text) {
         return dispatch_slash(state, client, cmd);

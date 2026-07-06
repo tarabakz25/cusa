@@ -14,13 +14,15 @@ use crate::codex_ui::style::user_message_style;
 use crate::codex_ui::ui_consts::LIVE_PREFIX_COLS;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Margin, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Stylize;
-use ratatui::text::{Line, Span};
+use ratatui::text::Span;
 use ratatui::widgets::{Block, StatefulWidgetRef, Widget, WidgetRef};
 
 /// Codex default placeholder (`Ask Codex to do anything` → cusa branding).
 pub const COMPOSER_PLACEHOLDER: &str = "Ask cusa to do anything";
+
+const COMPOSER_FOOTER_ROWS: u16 = 1;
 
 /// Result of feeding a key into the composer while the input pane is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,19 +37,22 @@ pub struct ComposerWidget {
     buffer: String,
     cursor_byte: usize,
     active: bool,
+    /// When true, omit the dim placeholder so IME preedit can render cleanly.
+    hide_placeholder: bool,
 }
 
 impl ComposerWidget {
     pub fn from_state(state: &AppState) -> Self {
         let view = CusaViewModel::composer_view(state);
-        Self::from_view(&view)
+        Self::from_view(&view, state.composer_input_active)
     }
 
-    pub fn from_view(view: &ComposerView) -> Self {
+    pub fn from_view(view: &ComposerView, hide_placeholder: bool) -> Self {
         Self {
             buffer: view.buffer.clone(),
             cursor_byte: char_index_to_byte(&view.buffer, view.cursor_pos),
             active: view.active,
+            hide_placeholder,
         }
     }
 
@@ -63,6 +68,46 @@ impl ComposerWidget {
         Self::desired_height(&state.input, width)
     }
 
+    /// Inner textarea rect inside a bottom-pane composer region (Codex insets).
+    pub fn textarea_rect(composer_area: Rect) -> Rect {
+        composer_area.inset(Insets::tlbr(1, LIVE_PREFIX_COLS, 1, 1))
+    }
+
+    /// Composer region within the bottom pane (excludes the status footer row).
+    pub fn composer_area_in_bottom_pane(bottom: Rect) -> Rect {
+        let composer_height = bottom
+            .height
+            .saturating_sub(COMPOSER_FOOTER_ROWS.min(bottom.height));
+        Rect {
+            x: bottom.x,
+            y: bottom.y,
+            width: bottom.width,
+            height: composer_height,
+        }
+    }
+
+    /// Terminal cursor for IME preedit — matches upstream `ChatComposer::cursor_pos`.
+    pub fn terminal_cursor(state: &AppState, screen: Rect) -> Option<(u16, u16)> {
+        if state.overlay.is_open() || !CusaViewModel::composer_view(state).active {
+            return None;
+        }
+        let bottom = composer_bottom_rect(screen, state)?;
+        let composer_area = Self::composer_area_in_bottom_pane(bottom);
+        let textarea_rect = Self::textarea_rect(composer_area);
+        if textarea_rect.is_empty() {
+            return None;
+        }
+
+        let mut textarea = TextArea::new();
+        textarea.set_text_clearing_elements(&state.input);
+        textarea.set_cursor(char_index_to_byte(&state.input, state.cursor_pos));
+        let ta_state = TextAreaState::default();
+
+        textarea
+            .cursor_pos_with_state(textarea_rect, ta_state)
+            .or(Some((textarea_rect.x, textarea_rect.y)))
+    }
+
     /// Render the Codex `ChatComposer` tinted input surface (no top rule).
     pub fn render_composer_surface(&self, area: Rect, buf: &mut Buffer) {
         if area.is_empty() {
@@ -72,7 +117,7 @@ impl ComposerWidget {
         let style = user_message_style();
         Block::default().style(style).render_ref(area, buf);
 
-        let textarea_rect = area.inset(Insets::tlbr(1, LIVE_PREFIX_COLS, 1, 1));
+        let textarea_rect = Self::textarea_rect(area);
         if textarea_rect.is_empty() {
             return;
         }
@@ -98,11 +143,17 @@ impl ComposerWidget {
             StatefulWidgetRef::render_ref(&(&textarea), textarea_rect, buf, &mut state);
         }
 
-        if self.active && self.buffer.is_empty() {
-            let placeholder = Span::from(COMPOSER_PLACEHOLDER).dim();
-            Line::from(vec![placeholder]).render_ref(
-                textarea_rect.inner(Margin::new(0, 0)),
-                buf,
+        let show_placeholder = self.active
+            && self.buffer.is_empty()
+            && !self.hide_placeholder;
+        if show_placeholder {
+            // Draw placeholder without advancing the terminal cursor (IME targets
+            // `textarea_rect.x` via `terminal_cursor`, not the end of this string).
+            buf.set_string(
+                textarea_rect.x,
+                textarea_rect.y,
+                COMPOSER_PLACEHOLDER,
+                ratatui::style::Style::default().dim(),
             );
         }
     }
@@ -120,6 +171,12 @@ pub fn handle_composer_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> ComposerKeyResult {
+    if matches!(code, KeyCode::Esc) {
+        if state.input.is_empty() {
+            state.composer_input_active = false;
+        }
+    }
+
     let event = KeyEvent {
         code,
         modifiers: mods,
@@ -129,14 +186,36 @@ pub fn handle_composer_key(
 
     let submit_keys = composer_submit_keys();
     if submit_keys.is_pressed(event) {
+        state.composer_input_active = false;
         return ComposerKeyResult::Submit;
+    }
+
+    if let KeyCode::Char(_) = code {
+        if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            state.composer_input_active = true;
+        }
     }
 
     let view = CusaViewModel::composer_view(state);
     let mut textarea = textarea_from_view(&view);
     textarea.input(event);
     apply_textarea_to_state(&mut textarea, state);
+
     ComposerKeyResult::Handled
+}
+
+fn composer_bottom_rect(screen: Rect, state: &AppState) -> Option<Rect> {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    let bottom_height =
+        crate::codex_adapter::bottom_pane::BottomPaneWidget::desired_height(state, screen.width);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(bottom_height),
+        ])
+        .split(screen);
+    Some(chunks[1])
 }
 
 fn textarea_from_view(view: &ComposerView) -> TextArea {
@@ -231,5 +310,49 @@ mod tests {
             content.contains(COMPOSER_PLACEHOLDER),
             "placeholder missing: {content:?}"
         );
+    }
+
+    #[test]
+    fn spec_ime_empty_buffer_cursor_at_textarea_origin_not_after_placeholder() {
+        let state = AppState::new("/tmp".into());
+        let screen = Rect::new(0, 0, 80, 10);
+        let (x, y) = ComposerWidget::terminal_cursor(&state, screen).expect("cursor");
+        let bottom = composer_bottom_rect(screen, &state).unwrap();
+        let textarea = ComposerWidget::textarea_rect(ComposerWidget::composer_area_in_bottom_pane(bottom));
+        assert_eq!((x, y), (textarea.x, textarea.y));
+    }
+
+    #[test]
+    fn spec_ime_hides_placeholder_after_input_begins() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut state = AppState::new("/tmp".into());
+        state.composer_input_active = true;
+        let widget = ComposerWidget::from_state(&state);
+        let backend = TestBackend::new(80, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(widget, f.area()))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            !content.contains(COMPOSER_PLACEHOLDER),
+            "placeholder should hide during IME: {content:?}"
+        );
+    }
+
+    #[test]
+    fn spec_ime_any_char_key_hides_placeholder_even_before_commit() {
+        let mut state = AppState::new("/tmp".into());
+        handle_composer_key(&mut state, KeyCode::Char('a'), KeyModifiers::empty());
+        assert!(state.composer_input_active);
+        assert_eq!(state.input, "a");
     }
 }

@@ -188,6 +188,10 @@ pub struct AppState {
     pub history_nav: Option<HistoryNav>,
     /// SPEC-092: forced history strategy.
     pub context_strategy: ContextStrategy,
+    /// True after the user begins interacting with the composer (including IME
+    /// composition before text is committed). Hides the placeholder so preedit
+    /// does not overlap the dim hint string.
+    pub composer_input_active: bool,
 }
 
 impl AppState {
@@ -223,6 +227,7 @@ impl AppState {
             input_history: VecDeque::new(),
             history_nav: None,
             context_strategy: ContextStrategy::Auto,
+            composer_input_active: false,
         }
     }
 
