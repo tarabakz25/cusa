@@ -89,7 +89,13 @@ export type TurnEvent =
   | { kind: "warning"; message: string };
 
 export interface SdkAdapter {
-  listModels(): Promise<ModelInfo[]>;
+  /**
+   * List models available to the given API key. The key must be passed
+   * explicitly: `Cursor.models.list()` falls back to `process.env`'s
+   * CURSOR_API_KEY when omitted, which silently breaks keys resolved
+   * from `~/.cusa/config.toml` (SPEC-016 / SPEC-100).
+   */
+  listModels(apiKey: string): Promise<ModelInfo[]>;
   createAgent(opts: CreateAgentOptions): Promise<AgentHandle>;
   resumeAgent(agentId: string, opts: ResumeAgentOptions): Promise<AgentHandle>;
 }
@@ -113,8 +119,8 @@ type SdkRun = Awaited<ReturnType<SdkAgent["send"]>>;
 class RealSdkAdapter implements SdkAdapter {
   constructor(private readonly sdk: CursorSdk) {}
 
-  async listModels(): Promise<ModelInfo[]> {
-    const models = await this.sdk.Cursor.models.list();
+  async listModels(apiKey: string): Promise<ModelInfo[]> {
+    const models = await this.sdk.Cursor.models.list({ apiKey });
     return models.map((m) => ({
       id: m.id,
       displayName: m.displayName,

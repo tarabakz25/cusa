@@ -260,8 +260,8 @@ function lazyAdapter(factory: () => Promise<SdkAdapter>): SdkAdapter {
   let real: Promise<SdkAdapter> | null = null;
   const get = () => (real ??= factory());
   return {
-    async listModels() {
-      return (await get()).listModels();
+    async listModels(apiKey) {
+      return (await get()).listModels(apiKey);
     },
     async createAgent(opts) {
       return (await get()).createAgent(opts);
