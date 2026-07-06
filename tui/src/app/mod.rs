@@ -8,7 +8,6 @@ pub mod approval;
 pub mod context;
 pub mod events;
 pub mod footer;
-pub mod input;
 pub mod internal;
 pub mod login;
 pub mod mcp;
@@ -24,9 +23,7 @@ pub mod usage;
 
 use crate::app::events::{spawn_input, TuiEvent};
 use crate::app::footer::FooterWidget;
-use crate::app::input::{
-    backspace, insert_char, move_end, move_home, move_left, move_right, InputWidget,
-};
+use crate::codex_adapter::{ComposerKeyResult, ComposerWidget, handle_composer_key};
 use crate::app::internal::{channel as internal_channel, AppInternalEvent, AppInternalRx};
 use crate::app::overlay::{
     cycle_approval_mode, ApprovalPickerOverlay, McpOverlay, ModelPickerOverlay, Overlay,
@@ -35,57 +32,96 @@ use crate::app::overlay::{
 use crate::app::slash::SlashCommand;
 use crate::app::state::{AppState, CtrlCOutcome, RunPhase, SidecarStatusView};
 use crate::app::status::{HeaderWidget, StatusWidget};
-use crate::app::transcript::{TranscriptEntry, TranscriptWidget};
+use crate::app::transcript::{TranscriptEntry, TurnState};
+use crate::codex_adapter::transcript::CodexTranscriptWidget;
 use crate::sidecar::events::{SidecarEvent, SidecarStatus};
 use crate::sidecar::SidecarClient;
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::event::{Event as CtEvent, KeyCode, KeyModifiers};
 use cusa_rpc::{ApprovalMode, RunFinishedParams, ServerNotification};
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::widgets::Widget;
 use ratatui::Terminal;
 use std::io;
+use std::path::Path;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// Split the screen into (header, status, transcript, input, footer).
-pub fn compute_layout(area: Rect) -> [Rect; 5] {
+pub fn compute_layout(area: Rect, state: &AppState) -> [Rect; 5] {
+    let input_height = ComposerWidget::desired_height_for_state(state, area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Length(1), // status
-            Constraint::Min(3),    // transcript
-            Constraint::Length(3), // input (border + content)
-            Constraint::Length(1), // footer
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(input_height),
+            Constraint::Length(1),
         ])
         .split(area);
     [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
 }
 
+/// Trait abstraction so `draw()` works with both ratatui and Codex `custom_terminal` frames.
+trait RenderFrame {
+    fn area(&self) -> Rect;
+    fn render_widget<W: Widget>(&mut self, widget: W, area: Rect);
+}
+
+impl RenderFrame for ratatui::Frame<'_> {
+    fn area(&self) -> Rect {
+        self.area()
+    }
+
+    fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
+        widget.render(area, self.buffer_mut());
+    }
+}
+
+impl RenderFrame for crate::codex_ui::custom_terminal::Frame<'_> {
+    fn area(&self) -> Rect {
+        self.area()
+    }
+
+    fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
+        widget.render(area, self.buffer_mut());
+    }
+}
+
+/// Render one frame of the app into any frame type (ratatui or custom_terminal).
+fn render_app_ui<F: RenderFrame>(state: &AppState, frame: &mut F) {
+    let [header, status, transcript, input, footer] = compute_layout(frame.area(), state);
+    frame.render_widget(HeaderWidget::new(state), header);
+    frame.render_widget(StatusWidget::new(state), status);
+    frame.render_widget(
+        CodexTranscriptWidget::new(
+            &state.transcript,
+            state.current_turn.as_ref(),
+            Path::new(&state.session.cwd),
+        ),
+        transcript,
+    );
+    frame.render_widget(ComposerWidget::from_state(state), input);
+    frame.render_widget(FooterWidget::new(state), footer);
+    if state.overlay.is_open() {
+        frame.render_widget(OverlayWidget::new(&state.overlay), frame.area());
+    }
+}
+
 /// Draw a single frame of the app into `terminal`.
 pub fn draw<B: Backend>(state: &AppState, terminal: &mut Terminal<B>) -> Result<()> {
-    terminal.draw(|f| {
-        let [header, status, transcript, input, footer] = compute_layout(f.area());
-        f.render_widget(HeaderWidget::new(state), header);
-        f.render_widget(StatusWidget::new(state), status);
-        f.render_widget(
-            TranscriptWidget::new(&state.transcript, state.current_turn.as_ref()),
-            transcript,
-        );
-        f.render_widget(
-            InputWidget::new(&state.input, state.cursor_pos, !state.overlay.is_open()),
-            input,
-        );
-        f.render_widget(FooterWidget::new(state), footer);
-        if state.overlay.is_open() {
-            f.render_widget(OverlayWidget::new(&state.overlay), f.area());
-        }
-    })?;
+    terminal.draw(|f| render_app_ui(state, f))?;
+    Ok(())
+}
+
+/// Draw using the vendored Codex `custom_terminal` backend (SPEC-105).
+pub fn draw_interactive(
+    state: &AppState,
+    terminal: &mut crate::terminal::InteractiveTerminal,
+) -> Result<()> {
+    terminal.draw(|f| render_app_ui(state, f))?;
     Ok(())
 }
 
@@ -360,33 +396,9 @@ pub fn handle_key(
         return KeyOutcome::Handled;
     }
 
-    match code {
-        KeyCode::Enter => submit_input(state, client),
-        KeyCode::Char(c) => {
-            insert_char(&mut state.input, &mut state.cursor_pos, c);
-            KeyOutcome::Handled
-        }
-        KeyCode::Backspace => {
-            backspace(&mut state.input, &mut state.cursor_pos);
-            KeyOutcome::Handled
-        }
-        KeyCode::Left => {
-            move_left(&mut state.cursor_pos);
-            KeyOutcome::Handled
-        }
-        KeyCode::Right => {
-            move_right(&state.input, &mut state.cursor_pos);
-            KeyOutcome::Handled
-        }
-        KeyCode::Home => {
-            move_home(&mut state.cursor_pos);
-            KeyOutcome::Handled
-        }
-        KeyCode::End => {
-            move_end(&state.input, &mut state.cursor_pos);
-            KeyOutcome::Handled
-        }
-        _ => KeyOutcome::Handled,
+    match handle_composer_key(state, code, mods) {
+        ComposerKeyResult::Submit => submit_input(state, client),
+        ComposerKeyResult::Handled => KeyOutcome::Handled,
     }
 }
 
@@ -824,11 +836,8 @@ pub async fn run_event_loop(
     client: SidecarClient,
     mut events: mpsc::UnboundedReceiver<SidecarEvent>,
 ) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let session = crate::terminal::TerminalSession::open()?;
+    let mut terminal = session.terminal;
 
     let (tui_tx, mut tui_rx) = mpsc::unbounded_channel::<TuiEvent>();
     let _input_task = spawn_input(tui_tx);
@@ -836,7 +845,7 @@ pub async fn run_event_loop(
     let (internal_tx, mut internal_rx) = internal_channel();
     state.internal_tx = Some(internal_tx);
 
-    let result = run_loop(
+    let result = run_interactive_loop(
         state,
         &client,
         &mut terminal,
@@ -846,9 +855,7 @@ pub async fn run_event_loop(
     )
     .await;
 
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
-    terminal.show_cursor().ok();
+    crate::terminal::TerminalSession { terminal }.teardown();
 
     // SPEC-050: bump the last-used timestamp so the next launch's chooser
     // lists this session at the top. Best-effort; ignored on failure.
@@ -867,6 +874,59 @@ pub async fn run_event_loop(
     result
 }
 
+async fn run_interactive_loop(
+    state: &mut AppState,
+    client: &SidecarClient,
+    terminal: &mut crate::terminal::InteractiveTerminal,
+    tui_rx: &mut mpsc::UnboundedReceiver<TuiEvent>,
+    events: &mut mpsc::UnboundedReceiver<SidecarEvent>,
+    internal_rx: &mut AppInternalRx,
+) -> Result<()> {
+    draw_interactive(state, terminal)?;
+    loop {
+        tokio::select! {
+            evt = tui_rx.recv() => {
+                match evt {
+                    Some(TuiEvent::Term(CtEvent::Key(k))) => {
+                        if let KeyOutcome::Quit = handle_key(state, client, k.code, k.modifiers) {
+                            break;
+                        }
+                    }
+                    Some(TuiEvent::Term(CtEvent::Resize(_, _))) => {
+                        let _ = crate::terminal::TerminalSession::sync_viewport(terminal);
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            evt = events.recv() => {
+                match evt {
+                    Some(e) => apply_sidecar_event(state, client, e),
+                    None => break,
+                }
+            }
+            evt = internal_rx.recv() => {
+                match evt {
+                    Some(e) => apply_internal_event(state, e),
+                    None => break,
+                }
+            }
+        }
+        // Toast auto-expiry: 2.5 seconds.
+        if let Overlay::Toast { created, .. } = state.overlay {
+            if created.elapsed().as_millis() > 2500 {
+                state.overlay = Overlay::None;
+            }
+        }
+        draw_interactive(state, terminal)?;
+        if state.should_quit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 async fn run_loop<B: Backend>(
     state: &mut AppState,
     client: &SidecarClient,

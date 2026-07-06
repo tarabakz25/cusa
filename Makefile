@@ -129,6 +129,17 @@ test-rust:
 	@printf "$(CYAN)==>$(RESET) cargo test --all\n"
 	@$(CARGO) test --all --manifest-path $(REPO_ROOT)/Cargo.toml
 
+## test-tui-snapshots: SPEC-110 insta snapshot gate (`*.snap.new` = failure until reviewed).
+.PHONY: test-tui-snapshots
+test-tui-snapshots:
+	@printf "$(CYAN)==>$(RESET) cargo test -p cusa-tui --test snapshots\n"
+	@$(CARGO) test -p cusa-tui --test snapshots --manifest-path $(REPO_ROOT)/Cargo.toml
+	@if find $(TUI_DIR)/tests/snapshots -name '*.snap.new' -print -quit 2>/dev/null | grep -q .; then \
+	  printf "$(BOLD)error:$(RESET) unreviewed snapshot diffs — run \`cargo insta review -p cusa-tui\` or delete *.snap.new\n"; \
+	  find $(TUI_DIR)/tests/snapshots -name '*.snap.new'; \
+	  exit 1; \
+	fi
+
 ## test-sidecar: Sidecar TypeScript tests (unit + drift + integration).
 .PHONY: test-sidecar
 test-sidecar:

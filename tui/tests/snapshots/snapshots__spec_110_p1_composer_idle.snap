@@ -1,0 +1,5 @@
+---
+source: tui/tests/snapshots.rs
+expression: render_composer_snapshot(&state, 80, 3)
+---
+────────────────────────────────────────────────────────────────────────────────›

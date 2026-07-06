@@ -1,17 +1,16 @@
 // Copyright 2026 cusa contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Header row + status line (SPEC-060 for the tokens portion).
+// Header row + status line (SPEC-060, SPEC-109).
 //
-// Row 0 renders `cusa · <session-id-short> · <cwd-truncated>`.
-// Row 1 renders `<model> · <approval-mode> · skills(N) · mcp(N) · <tokens>`.
+// Row 0 and row 1 render through vendored Codex status chrome with `cusa`
+// branding (magenta), not `Codex`.
 
 use crate::app::state::AppState;
-use cusa_rpc::ApprovalMode;
+use crate::codex_adapter::status_chrome;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 
 /// Header widget for row 0.
@@ -26,27 +25,13 @@ impl<'a> HeaderWidget<'a> {
     }
 
     pub fn line(&self) -> Line<'static> {
-        let short = self.state.session.short_id();
-        let cwd = truncate_cwd(&self.state.session.cwd, 48);
-        Line::from(vec![
-            Span::styled(
-                "cusa",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" · "),
-            Span::styled(short, Style::default().fg(Color::Cyan)),
-            Span::raw(" · "),
-            Span::styled(cwd, Style::default().fg(Color::DarkGray)),
-        ])
+        status_chrome::header_line(self.state)
     }
 }
 
 impl<'a> Widget for HeaderWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let line = self.line();
-        Paragraph::new(line).render(area, buf);
+        Paragraph::new(self.line()).render(area, buf);
     }
 }
 
@@ -62,42 +47,7 @@ impl<'a> StatusWidget<'a> {
     }
 
     pub fn line(&self) -> Line<'static> {
-        let s = self.state;
-        let mode_label = approval_label(s.session.approval_mode);
-        let sidecar = s.session.sidecar_status.label();
-        let tokens = s.usage.snapshot().status_line();
-        let mut spans = vec![Span::styled(
-            s.session.model.clone(),
-            Style::default().fg(Color::Cyan),
-        )];
-        if s.session.manual_model_override.is_some() {
-            spans.push(Span::styled(
-                " [override]".to_string(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ));
-        }
-        spans.extend([
-            Span::raw(" · "),
-            Span::styled(mode_label.to_string(), Style::default().fg(Color::Yellow)),
-            Span::raw(" · "),
-            Span::styled(
-                format!("skills({})", s.session.skills_count),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(" · "),
-            Span::styled(
-                format!("mcp({})", s.session.mcp_count),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(" · "),
-            Span::styled(tokens, Style::default().fg(Color::Green)),
-            Span::raw(" · "),
-            Span::styled(
-                format!("sidecar:{sidecar}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-        Line::from(spans)
+        status_chrome::status_line(self.state)
     }
 }
 
@@ -105,22 +55,6 @@ impl<'a> Widget for StatusWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         Paragraph::new(self.line()).render(area, buf);
     }
-}
-
-fn approval_label(mode: ApprovalMode) -> &'static str {
-    match mode {
-        ApprovalMode::Suggest => "suggest",
-        ApprovalMode::AutoEdit => "auto-edit",
-        ApprovalMode::FullAuto => "full-auto",
-    }
-}
-
-fn truncate_cwd(cwd: &str, max: usize) -> String {
-    if cwd.chars().count() <= max {
-        return cwd.to_string();
-    }
-    let tail: String = cwd.chars().rev().take(max - 1).collect::<Vec<_>>().into_iter().rev().collect();
-    format!("…{tail}")
 }
 
 #[cfg(test)]
@@ -154,6 +88,7 @@ mod tests {
         let out = render_row(HeaderWidget::new(&s), 60);
         assert!(out.contains("cusa"));
         assert!(out.contains("/repo/here"));
+        assert!(!out.contains("Codex"));
     }
 
     #[test]
@@ -178,10 +113,13 @@ mod tests {
     }
 
     #[test]
-    fn spec_060_truncate_cwd_prepends_ellipsis() {
-        let long = "/very/very/very/very/very/very/very/deep/path/segment/finalfilehere";
-        let t = truncate_cwd(long, 20);
-        assert!(t.starts_with('…'), "got {t}");
-        assert_eq!(t.chars().count(), 20);
+    fn spec_109_header_branding_is_magenta_cusa() {
+        let s = AppState::new("/tmp".into());
+        let line = HeaderWidget::new(&s).line();
+        let brand = line
+            .spans
+            .first()
+            .expect("header has spans");
+        assert_eq!(brand.content, "cusa");
     }
 }

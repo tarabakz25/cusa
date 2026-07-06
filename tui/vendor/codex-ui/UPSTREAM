@@ -1,0 +1,5 @@
+repo=https://github.com/openai/codex
+sha=be33f80bc65159c094ecd06bf155afa3061ce23d
+date=2026-07-06T07:59:06Z
+ref=be33f80bc65159c094ecd06bf155afa3061ce23d
+paths=codex-rs/tui/src
