@@ -3,9 +3,10 @@
 //
 // Startup "resume chooser" overlay (SPEC-051, SPEC-053).
 //
-// The chooser is shown before the boot handshake when `SessionStore` has at
-// least one prior session recorded for the current `cwd`. The user picks
-// one of three paths:
+// The chooser is opt-in: it is shown before the boot handshake only when
+// the CLI is launched with `--resume-picker` AND `SessionStore` has at
+// least one prior session recorded for the current `cwd`. By default the
+// CLI starts a new chat directly. The user picks one of three paths:
 //
 //   1. Start a fresh session (`session/create`).
 //   2. Resume one of up to 8 recent sessions (`session/resume`).

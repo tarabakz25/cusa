@@ -22,7 +22,8 @@ authoritative specification.
 - **Cursor-format skills** loaded from `~/.cursor/skills/**/SKILL.md`.
 - **Layered MCP config** matching Cursor precedence.
 - **Codex-style approval modes**: `suggest`, `auto-edit`, `full-auto`.
-- **Local sessions** stored in `~/.cusa/sessions.json`; resume by picking or
+- **Local sessions** stored in `~/.cusa/sessions.json`; startup opens a new
+  chat by default — resume via the `--resume-picker` chooser or
   `--resume <agentId>`.
 - **Cumulative + per-turn token telemetry** in the status line and `/cost`.
 

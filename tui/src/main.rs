@@ -37,6 +37,11 @@ struct Cli {
     #[arg(long)]
     resume: Option<String>,
 
+    /// Show the resume-session picker at startup instead of starting a
+    /// new chat (SPEC-051).
+    #[arg(long)]
+    resume_picker: bool,
+
     /// Enable verbose logging to `~/.cusa/logs/` (SPEC-102).
     #[arg(long)]
     verbose: bool,
@@ -77,13 +82,17 @@ async fn run(mut cli: Cli, log_path: Option<std::path::PathBuf>) -> Result<()> {
         }
     };
 
-    // SPEC-051: BEFORE spawning the sidecar, offer to resume a session for
-    // this cwd if we have any. Falling back to "New session" on Esc keeps
-    // behavior identical to older versions.
+    // SPEC-051: the resume chooser is opt-in via `--resume-picker`. By
+    // default the CLI boots straight into a new chat; `--resume <id>`
+    // (SPEC-052) still targets a session directly and bypasses the picker.
     let session_store = session_store::SessionStore::for_config();
-    let candidates = session_store.list_for_cwd(&cwd);
-    let resume_choice = if !candidates.is_empty() {
-        Some(app::startup::run_blocking(candidates, &cwd)?)
+    let resume_choice = if cli.resume_picker && cli.resume.is_none() {
+        let candidates = session_store.list_for_cwd(&cwd);
+        if !candidates.is_empty() {
+            Some(app::startup::run_blocking(candidates, &cwd)?)
+        } else {
+            None
+        }
     } else {
         None
     };
