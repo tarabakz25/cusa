@@ -481,3 +481,98 @@ test("issue #5: a send that resolves within the budget is unaffected by the time
   assert.ok(send.runId);
   await until(() => emitted.some((e) => e.method === "run/finished"));
 });
+
+// ----------------------------------------------------------------------
+// issue #5 follow-up: stale-run recovery ("already has active run")
+// ----------------------------------------------------------------------
+
+test("issue #5: a stale active run in the SDK store is cancelled and the send retried", async () => {
+  const { mgr, adapter, emitted } = newHarness();
+  const create = await mgr.createSession({ cwd: "/tmp/repo" });
+  adapter.busyNextSends = 1;
+  adapter.script({
+    events: [{ kind: "text-delta", delta: "ok", textKind: "assistant" }],
+    result: { status: "finished" },
+  });
+  const send = await mgr.sendMessage({
+    sessionId: create.sessionId,
+    text: "hello",
+  });
+  assert.ok(send.runId, "retry after recovery must establish a run");
+  assert.equal(adapter.state.cancelStaleRunsCalls.length, 1);
+  assert.deepEqual(adapter.state.cancelStaleRunsCalls[0], {
+    agentId: "fake-agent-1",
+    cwd: "/tmp/repo",
+  });
+  await until(() => emitted.some((e) => e.method === "run/finished"));
+});
+
+test("issue #5: recovery is attempted exactly once — persistent busy rejects with a fresh-session hint", async () => {
+  const { mgr, adapter } = newHarness();
+  const create = await mgr.createSession({ cwd: "/tmp/repo" });
+  adapter.busyNextSends = 2;
+  await assert.rejects(
+    async () => {
+      await mgr.sendMessage({ sessionId: create.sessionId, text: "hello" });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof SessionRpcError);
+      assert.equal((err as SessionRpcError).code, RpcErrorCode.AgentError);
+      assert.match((err as SessionRpcError).message, /already has active run/);
+      assert.match((err as SessionRpcError).message, /fresh session/);
+      return true;
+    },
+  );
+  assert.equal(
+    adapter.state.cancelStaleRunsCalls.length,
+    1,
+    "must not loop recovery",
+  );
+});
+
+test("issue #5: a failing recovery surfaces an actionable error", async () => {
+  const { mgr, adapter } = newHarness();
+  const create = await mgr.createSession({ cwd: "/tmp/repo" });
+  adapter.busyNextSends = 1;
+  adapter.failCancelStaleRuns = true;
+  await assert.rejects(
+    async () => {
+      await mgr.sendMessage({ sessionId: create.sessionId, text: "hello" });
+    },
+    (err: unknown) => {
+      assert.ok(err instanceof SessionRpcError);
+      assert.equal((err as SessionRpcError).code, RpcErrorCode.AgentError);
+      assert.match(
+        (err as SessionRpcError).message,
+        /stale-run recovery failed/,
+      );
+      assert.match((err as SessionRpcError).message, /fresh session/);
+      return true;
+    },
+  );
+});
+
+test("issue #5: a timed-out send followed by a busy retry self-heals", async () => {
+  // The exact wedge reported on the PR: send #1 hangs past the timeout —
+  // the SDK wrote the run record before the network phase, so the store
+  // keeps a non-terminal run. Send #2 then gets "already has active run"
+  // and must recover transparently.
+  const { mgr, adapter, emitted } = newHarness({ sendTimeoutMs: 25 });
+  const create = await mgr.createSession({ cwd: "/tmp/repo" });
+  adapter.hangNextSend = true;
+  await assert.rejects(async () => {
+    await mgr.sendMessage({ sessionId: create.sessionId, text: "first" });
+  });
+  adapter.busyNextSends = 1;
+  adapter.script({
+    events: [{ kind: "text-delta", delta: "recovered", textKind: "assistant" }],
+    result: { status: "finished" },
+  });
+  const send = await mgr.sendMessage({
+    sessionId: create.sessionId,
+    text: "second",
+  });
+  assert.ok(send.runId);
+  assert.equal(adapter.state.cancelStaleRunsCalls.length, 1);
+  await until(() => emitted.some((e) => e.method === "run/finished"));
+});

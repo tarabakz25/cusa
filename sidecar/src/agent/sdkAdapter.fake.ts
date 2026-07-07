@@ -56,6 +56,8 @@ export interface FakeAdapterState {
     systemContext?: string;
     mcpServers?: Record<string, unknown>;
   }>;
+  /** Arguments of every `cancelStaleRuns` call, in call order. */
+  cancelStaleRunsCalls: Array<{ agentId: string; cwd: string }>;
 }
 
 export class FakeSdkAdapter implements SdkAdapter {
@@ -71,6 +73,7 @@ export class FakeSdkAdapter implements SdkAdapter {
     resumeCalls: [],
     disposedAgentIds: [],
     sendCalls: [],
+    cancelStaleRunsCalls: [],
   };
 
   /**
@@ -86,8 +89,33 @@ export class FakeSdkAdapter implements SdkAdapter {
    */
   hangNextSend = false;
 
+  /**
+   * When > 0, the next N `send()` calls reject with the SDK's local-store
+   * busy error ("Agent <id> already has active run") before any turn is
+   * created — mirroring @cursor/sdk, whose store guard runs before the
+   * network phase. Decremented per rejected send.
+   */
+  busyNextSends = 0;
+
+  /** Value `cancelStaleRuns` reports as the number of cancelled runs. */
+  staleRunsToCancel = 1;
+
+  /** When true, `cancelStaleRuns` rejects (simulates a broken store). */
+  failCancelStaleRuns = false;
+
   script(...s: TurnScript[]): void {
     this.scripts.push(...s);
+  }
+
+  async cancelStaleRuns(
+    agentId: string,
+    opts: { cwd: string },
+  ): Promise<number> {
+    this.state.cancelStaleRunsCalls.push({ agentId, cwd: opts.cwd });
+    if (this.failCancelStaleRuns) {
+      throw new Error("fake local agent store unavailable");
+    }
+    return this.staleRunsToCancel;
   }
 
   async listModels(apiKey: string): Promise<ModelInfo[]> {
@@ -135,6 +163,10 @@ class FakeAgentHandle implements AgentHandle {
         ? {}
         : { mcpServers: opts.mcpServers }),
     });
+    if (this.adapter.busyNextSends > 0) {
+      this.adapter.busyNextSends -= 1;
+      throw new Error(`Agent ${this.agentId} already has active run`);
+    }
     if (this.adapter.hangNextSend) {
       this.adapter.hangNextSend = false;
       return new Promise<TurnHandle>((_, reject) => {

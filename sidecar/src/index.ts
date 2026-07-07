@@ -263,6 +263,9 @@ function lazyAdapter(factory: () => Promise<SdkAdapter>): SdkAdapter {
     async listModels(apiKey) {
       return (await get()).listModels(apiKey);
     },
+    async cancelStaleRuns(agentId, opts) {
+      return (await get()).cancelStaleRuns(agentId, opts);
+    },
     async createAgent(opts) {
       return (await get()).createAgent(opts);
     },

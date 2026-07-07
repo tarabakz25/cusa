@@ -320,25 +320,36 @@ export class SessionManager {
     // Events can start flowing the moment the adapter's turn exists —
     // potentially before `session.activeRun` is assigned below (the gap
     // spans several microtasks). Buffer them until the run is established
-    // so early deltas / tool calls are never silently dropped.
+    // so early deltas / tool calls are never silently dropped. If the send
+    // fails for good, flip to dropping so a ghost run that keeps streaming
+    // can never grow the buffer for its whole lifetime.
     let earlyEvents: Array<import("./sdkAdapter.js").TurnEvent> | null = [];
+    let dropTurnEvents = false;
+
+    const sendOptions: SendOptions = {
+      modelOverride: effectiveModel,
+      onEvent: (event) => {
+        if (dropTurnEvents) return;
+        if (earlyEvents !== null) {
+          earlyEvents.push(event);
+          return;
+        }
+        this.dispatchTurnEvent(session, event);
+      },
+    };
+    if (systemContext !== undefined) sendOptions.systemContext = systemContext;
+    if (mcpForTurn !== undefined) sendOptions.mcpServers = mcpForTurn;
 
     try {
-      const sendOptions: SendOptions = {
-        modelOverride: effectiveModel,
-        onEvent: (event) => {
-          if (earlyEvents !== null) {
-            earlyEvents.push(event);
-            return;
-          }
-          this.dispatchTurnEvent(session, event);
-        },
-      };
-      if (systemContext !== undefined) sendOptions.systemContext = systemContext;
-      if (mcpForTurn !== undefined) sendOptions.mcpServers = mcpForTurn;
-      turn = await this.sendWithTimeout(session, params.text, sendOptions);
+      turn = await this.sendWithStaleRunRecovery(
+        session,
+        params.text,
+        sendOptions,
+      );
       runId = turn.runId;
     } catch (err) {
+      dropTurnEvents = true;
+      earlyEvents = null;
       if (err instanceof SessionRpcError) throw err;
       throw this.wrapAgentError(err, "session/send failed");
     }
@@ -378,6 +389,76 @@ export class SessionManager {
     void this.awaitTurn(session, active);
 
     return { runId };
+  }
+
+  /**
+   * `agent.send()` with automatic stale-run recovery (issue #5 follow-up).
+   *
+   * The SDK's local agent store persists `agent.activeRunId`, and `send()`
+   * refuses with "Agent <id> already has active run" while that run's
+   * record is non-terminal. The store has no staleness sweep, so a run
+   * whose process died mid-stream (crash, kill) or whose network phase
+   * hung (e.g. our own send timeout below — the SDK writes the run record
+   * *before* opening the stream) wedges the agent permanently: every
+   * subsequent send fails.
+   *
+   * SessionManager itself tracks at most one live run per session (the
+   * `activeRun` guard at the top of `sendMessage`), so when the SDK
+   * reports "busy" while we track no run, the recorded run is stale by
+   * definition. Recovery: cancel the stale record(s) in the store — which
+   * clears `activeRunId` — and retry the send exactly once.
+   */
+  private async sendWithStaleRunRecovery(
+    session: SessionState,
+    text: string,
+    sendOptions: SendOptions,
+  ): Promise<TurnHandle> {
+    try {
+      return await this.sendWithTimeout(session, text, sendOptions);
+    } catch (err) {
+      if (!isAgentBusyError(err)) throw err;
+      this.log(
+        "warn",
+        `agent ${session.agent.agentId} reports an active run but none is tracked — ` +
+          "cancelling stale run(s) in the local store and retrying",
+      );
+      let cancelledCount: number;
+      try {
+        cancelledCount = await this.adapter.cancelStaleRuns(
+          session.agent.agentId,
+          { cwd: session.cwd },
+        );
+      } catch (recoveryErr) {
+        const detail =
+          recoveryErr instanceof Error
+            ? recoveryErr.message
+            : String(recoveryErr);
+        throw new SessionRpcError(
+          RpcErrorCode.AgentError,
+          `session/send failed: ${(err as Error).message} — automatic ` +
+            `stale-run recovery failed (${detail}); start a fresh ` +
+            'session (relaunch cusa and pick "New session")',
+        );
+      }
+      this.log(
+        "info",
+        `stale-run recovery cancelled ${cancelledCount} run(s); retrying send`,
+      );
+      try {
+        return await this.sendWithTimeout(session, text, sendOptions);
+      } catch (retryErr) {
+        if (isAgentBusyError(retryErr)) {
+          throw new SessionRpcError(
+            RpcErrorCode.AgentError,
+            `session/send failed: ${(retryErr as Error).message} — the ` +
+              "agent is still busy after stale-run recovery (another " +
+              "process may be driving it); start a fresh session " +
+              '(relaunch cusa and pick "New session")',
+          );
+        }
+        throw retryErr;
+      }
+    }
   }
 
   /**
@@ -901,6 +982,17 @@ export class SessionManager {
       err instanceof Error ? `${prefix}: ${err.message}` : `${prefix}`;
     return new SessionRpcError(RpcErrorCode.AgentError, message);
   }
+}
+
+/**
+ * True when `err` is the SDK's "agent busy" rejection. The local-agent
+ * path throws a plain `Error` with this message (not `AgentBusyError`,
+ * which the cloud path uses for HTTP 409) — match both.
+ */
+function isAgentBusyError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === "AgentBusyError") return true;
+  return /already has (an )?active run/i.test(err.message);
 }
 
 function previewArgs(args: unknown): string {
