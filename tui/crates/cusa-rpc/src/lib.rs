@@ -151,6 +151,8 @@ pub enum LogLevel {
 pub enum RouterSource {
     Rule,
     Llm,
+    /// Local semantic classifier (Super Auto Mode, issue #7).
+    Local,
     Override,
     Fallback,
 }
@@ -866,6 +868,7 @@ mod tests {
     fn router_source_camel_case() {
         assert_eq!(serde_json::to_string(&RouterSource::Rule).unwrap(), "\"rule\"");
         assert_eq!(serde_json::to_string(&RouterSource::Llm).unwrap(), "\"llm\"");
+        assert_eq!(serde_json::to_string(&RouterSource::Local).unwrap(), "\"local\"");
         assert_eq!(serde_json::to_string(&RouterSource::Override).unwrap(), "\"override\"");
         assert_eq!(serde_json::to_string(&RouterSource::Fallback).unwrap(), "\"fallback\"");
     }

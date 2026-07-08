@@ -53,6 +53,7 @@ impl CusaViewModel {
         match source {
             RouterSource::Rule => RouterSourceView::Rule,
             RouterSource::Llm => RouterSourceView::Llm,
+            RouterSource::Local => RouterSourceView::Local,
             RouterSource::Override => RouterSourceView::Override,
             RouterSource::Fallback => RouterSourceView::Fallback,
         }

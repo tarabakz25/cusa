@@ -36,6 +36,8 @@ import {
   type ToolApprovalResponseParams,
 } from "./rpc/schema.js";
 import { RpcServer, RpcMethodError } from "./rpc/server.js";
+import { Router } from "./router/index.js";
+import { watchRouterConfig } from "./router/config.js";
 import { RotatingLogger } from "./logging/rotate.js";
 import { loadConversationConfig } from "./config/conversation.js";
 import {
@@ -57,6 +59,13 @@ export interface BuildServerOptions {
    * on config + SDK detection.
    */
   context?: ContextManager;
+  /**
+   * Optional pre-configured Router (e.g. loaded from `~/.cusa/router.toml`
+   * with hot reload — see `bootstrapRouter`). When omitted the
+   * SessionManager falls back to a Router with built-in defaults, which
+   * keeps `buildServer()` hermetic for tests.
+   */
+  router?: Router;
   /** Rotating log path override (defaults to `process.env.CUSA_LOG_FILE`). */
   logFilePath?: string;
 }
@@ -117,6 +126,7 @@ export function buildServer(opts: BuildServerOptions = {}): {
       });
     },
     context: contextManager,
+    ...(opts.router !== undefined ? { router: opts.router } : {}),
   });
 
   const version = opts.sidecarVersion ?? SIDECAR_VERSION;
@@ -238,6 +248,28 @@ export async function bootstrapContext(opts: {
 }
 
 /**
+ * Load `~/.cusa/router.toml` into a Router and keep it hot-reloading
+ * (SPEC-014, issue #7). Without this, Super Auto Mode's
+ * `local_classifier_enabled` / `[[exemplars]]` / θ knobs could never be
+ * turned on in production — the SessionManager's fallback Router only
+ * ever sees built-in defaults.
+ */
+export async function bootstrapRouter(opts: {
+  log: (level: "info" | "warn" | "error", msg: string) => void;
+  configPath?: string;
+}): Promise<{ router: Router; close: () => void }> {
+  const router = new Router({ log: opts.log });
+  const watchArgs: Parameters<typeof watchRouterConfig>[0] = {
+    log: opts.log,
+    onReload: (next) => router.updateConfig(next),
+  };
+  if (opts.configPath !== undefined) watchArgs.configPath = opts.configPath;
+  const watcher = await watchRouterConfig(watchArgs);
+  router.updateConfig(watcher.current());
+  return { router, close: () => watcher.close() };
+}
+
+/**
  * Wrap a SessionManager call so `SessionRpcError` is translated to the
  * `RpcMethodError` shape the server expects.
  */
@@ -304,7 +336,22 @@ async function defaultSdkVersion(): Promise<string> {
 }
 
 export async function main(): Promise<void> {
-  const { server, contextManager } = buildServer();
+  // Router config must load before buildServer so the SessionManager is
+  // constructed with the disk-backed, hot-reloading Router (issue #7).
+  const routerLogs: Array<["info" | "warn" | "error", string]> = [];
+  let routerNotify: ((level: string, message: string) => void) | null = null;
+  const routerBootstrap = await bootstrapRouter({
+    log: (level, message) => {
+      if (routerNotify) routerNotify(level, message);
+      else routerLogs.push([level, message]);
+    },
+  });
+  const { server, contextManager } = buildServer({
+    router: routerBootstrap.router,
+  });
+  routerNotify = (level, message) =>
+    server.notify(Method.Log, { level, message, target: "sidecar/router" });
+  for (const [level, message] of routerLogs) routerNotify(level, message);
   // Resolve conversation.mode + SDK detection asynchronously; the
   // initialize handler will read the ContextManager state at request
   // time so it always reports the current retention decision.
