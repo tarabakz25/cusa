@@ -29,6 +29,11 @@ impl TerminalSession {
         let colors = terminal_probe::default_colors(terminal_probe::DEFAULT_TIMEOUT).ok().flatten();
         set_default_colors_from_startup_probe(colors);
         let mut stdout = io::stdout();
+        // Mouse capture drives tmux-style copy-on-select (PR #9): drag
+        // highlights a region and releasing the button copies it to the
+        // clipboard with a `copied …` toast — no Cmd+C needed. Native
+        // terminal selection stays reachable through the standard capture
+        // bypass (Shift+drag in most terminals, Option/Alt+drag in iTerm2).
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = custom_terminal::Terminal::with_options(backend)?;
@@ -47,8 +52,8 @@ impl TerminalSession {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
+            DisableMouseCapture,
+            LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
     }
