@@ -169,6 +169,15 @@ where
     /// Last known position of the cursor. Used to find the new area when the viewport is inlined
     /// and the terminal resized.
     pub last_known_cursor_pos: Position,
+    /// Cursor state (position + style discriminant) emitted by the previous draw call. Used to
+    /// skip cursor escape sequences on frames where nothing changed: some terminals (Windows
+    /// Terminal, xterm.js-based ones) dismiss the user's active text selection on ANY output,
+    /// so redundant per-tick cursor writes made it impossible to select/copy transcript text.
+    last_frame_cursor: Option<(Option<Position>, std::mem::Discriminant<SetCursorStyle>)>,
+    /// When true, the next flush emits `ClearToEnd` for every row with trailing blanks even if
+    /// the previous buffer says they are already blank. Set after explicit clears / viewport
+    /// changes, where the real screen content is unknown to the diff buffers.
+    force_row_clears: bool,
     /// Count of visible history rows rendered above the viewport in inline mode.
     visible_history_rows: u16,
 }
@@ -247,6 +256,8 @@ where
             ),
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
+            last_frame_cursor: None,
+            force_row_clears: true,
             visible_history_rows: 0,
         }
     }
@@ -302,13 +313,18 @@ where
 
     /// Obtains a difference between the previous and the current buffer and passes it to the
     /// current backend for drawing.
-    pub fn flush(&mut self) -> io::Result<()> {
-        let updates = diff_buffers(self.previous_buffer(), self.current_buffer());
+    pub fn flush(&mut self) -> io::Result<bool> {
+        let force_row_clears = std::mem::take(&mut self.force_row_clears);
+        let updates = diff_buffers(self.previous_buffer(), self.current_buffer(), force_row_clears);
+        let has_updates = !updates.is_empty();
         let last_put_command = updates.iter().rfind(|command| command.is_put());
         if let Some(&DrawCommand::Put { x, y, .. }) = last_put_command {
             self.last_known_cursor_pos = Position { x, y };
         }
-        draw(&mut self.backend, updates.into_iter())
+        if has_updates {
+            draw(&mut self.backend, updates.into_iter())?;
+        }
+        Ok(has_updates)
     }
 
     /// Updates the Terminal so that internal buffers match the requested area.
@@ -317,6 +333,7 @@ where
     /// of the screen.
     pub fn resize(&mut self, screen_size: Size) -> io::Result<()> {
         self.last_known_screen_size = screen_size;
+        self.force_row_clears = true;
         Ok(())
     }
 
@@ -326,6 +343,8 @@ where
         self.previous_buffer_mut().resize(area);
         self.viewport_area = area;
         self.visible_history_rows = self.visible_history_rows.min(area.top());
+        self.last_frame_cursor = None;
+        self.force_row_clears = true;
     }
 
     /// Queries the backend for size and resizes if it doesn't match the previous size.
@@ -425,15 +444,23 @@ where
         let cursor_style = frame.cursor_style;
 
         // Draw to stdout
-        self.flush()?;
+        let wrote_cells = self.flush()?;
 
-        match cursor_position {
-            None => self.hide_cursor()?,
-            Some(position) => {
-                self.set_cursor_style(cursor_style)?;
-                self.show_cursor()?;
-                self.set_cursor_position(position)?;
+        // Only touch the hardware cursor when cells were written (the diff pass moves the
+        // cursor) or the requested cursor state changed. Emitting these escapes on every
+        // periodic tick clears the user's text selection in terminals that dismiss
+        // selection on any output, breaking copy from the composer and transcript.
+        let cursor_state = (cursor_position, std::mem::discriminant(&cursor_style));
+        if wrote_cells || self.last_frame_cursor != Some(cursor_state) {
+            match cursor_position {
+                None => self.hide_cursor()?,
+                Some(position) => {
+                    self.set_cursor_style(cursor_style)?;
+                    self.show_cursor()?;
+                    self.set_cursor_position(position)?;
+                }
             }
+            self.last_frame_cursor = Some(cursor_state);
         }
 
         self.swap_buffers();
@@ -497,6 +524,8 @@ where
         self.backend.clear_region(ClearType::AfterCursor)?;
         // Reset the back buffer to make sure the next update will redraw everything.
         self.previous_buffer_mut().reset();
+        self.last_frame_cursor = None;
+        self.force_row_clears = true;
         Ok(())
     }
 
@@ -505,6 +534,7 @@ where
     /// content outside ratatui's knowledge.
     pub fn invalidate_viewport(&mut self) {
         self.previous_buffer_mut().reset();
+        self.force_row_clears = true;
     }
 
     /// Clear terminal scrollback (if supported) and force a full redraw.
@@ -520,6 +550,7 @@ where
         self.set_cursor_position(home)?;
         std::io::Write::flush(&mut self.backend)?;
         self.previous_buffer_mut().reset();
+        self.force_row_clears = true;
         Ok(())
     }
 
@@ -535,6 +566,7 @@ where
         std::io::Write::flush(&mut self.backend)?;
         self.visible_history_rows = 0;
         self.previous_buffer_mut().reset();
+        self.force_row_clears = true;
         Ok(())
     }
 
@@ -554,6 +586,7 @@ where
         self.last_known_cursor_pos = Position { x: 0, y: 0 };
         self.visible_history_rows = 0;
         self.previous_buffer_mut().reset();
+        self.force_row_clears = true;
         Ok(())
     }
 
@@ -588,7 +621,24 @@ enum DrawCommand {
     ClearToEnd { x: u16, y: u16, bg: Color },
 }
 
-fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
+// Scan a row to find the rightmost column that still matters: any non-space glyph, any cell
+// whose bg differs from `bg`, or any cell with modifiers. Multi-width glyphs extend that
+// region through their full displayed width.
+fn last_relevant_column(row: &[Cell], bg: Color) -> usize {
+    let mut last = 0usize;
+    let mut column = 0usize;
+    while column < row.len() {
+        let cell = &row[column];
+        let width = display_width(cell.symbol());
+        if cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
+            last = column + (width.saturating_sub(1));
+        }
+        column += width.max(1); // treat zero-width symbols as width 1
+    }
+    last
+}
+
+fn diff_buffers(a: &Buffer, b: &Buffer, force_row_clears: bool) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
 
@@ -600,25 +650,21 @@ fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
         let row = &next_buffer[row_start..row_end];
         let bg = row.last().map(|cell| cell.bg).unwrap_or(Color::Reset);
 
-        // Scan the row to find the rightmost column that still matters: any non-space glyph,
-        // any cell whose bg differs from the row’s trailing bg, or any cell with modifiers.
-        // Multi-width glyphs extend that region through their full displayed width.
-        // After that point the rest of the row can be cleared with a single ClearToEnd, a perf win
-        // versus emitting multiple space Put commands.
-        let mut last_nonblank_column = 0usize;
-        let mut column = 0usize;
-        while column < row.len() {
-            let cell = &row[column];
-            let width = display_width(cell.symbol());
-            if cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
-                last_nonblank_column = column + (width.saturating_sub(1));
-            }
-            column += width.max(1); // treat zero-width symbols as width 1
-        }
+        // Everything right of the last relevant column can be cleared with a single
+        // ClearToEnd, a perf win versus emitting multiple space Put commands.
+        let last_nonblank_column = last_relevant_column(row, bg);
 
         if last_nonblank_column + 1 < row.len() {
-            let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
-            updates.push(DrawCommand::ClearToEnd { x, y, bg });
+            // Only emit the clear when the previous frame actually had content there (or a
+            // forced clear was requested). Unconditional per-row clears produce terminal
+            // output on every draw tick even for identical frames, which dismisses the
+            // user's active text selection in terminals that clear selection on output —
+            // making it impossible to copy text from the transcript/composer.
+            let prev_row = &previous_buffer[row_start..row_end];
+            if force_row_clears || last_relevant_column(prev_row, bg) > last_nonblank_column {
+                let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
+                updates.push(DrawCommand::ClearToEnd { x, y, bg });
+            }
         }
 
         last_nonblank_columns[y as usize] = last_nonblank_column as u16;
@@ -779,22 +825,19 @@ impl ModifierDiff {
     }
 }
 
-#[cfg(all(test, feature = "vendor-tests"))]
-mod tests {
+#[cfg(test)]
+mod test_backend {
     use super::*;
-    use pretty_assertions::assert_eq;
     use ratatui::backend::WindowSize;
-    use ratatui::layout::Rect;
-    use ratatui::style::Style;
 
-    struct CaptureBackend {
+    pub(super) struct CaptureBackend {
         output: Vec<u8>,
         size: Size,
         cursor: Position,
     }
 
     impl CaptureBackend {
-        fn new(width: u16, height: u16) -> Self {
+        pub(super) fn new(width: u16, height: u16) -> Self {
             Self {
                 output: Vec::new(),
                 size: Size { width, height },
@@ -802,7 +845,7 @@ mod tests {
             }
         }
 
-        fn output(&self) -> String {
+        pub(super) fn output(&self) -> String {
             String::from_utf8_lossy(&self.output).into_owned()
         }
     }
@@ -886,6 +929,78 @@ mod tests {
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::test_backend::CaptureBackend;
+    use super::*;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn unchanged_frame_emits_no_output() {
+        let mut terminal =
+            Terminal::with_options(CaptureBackend::new(/*width*/ 4, /*height*/ 2))
+                .expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, 4, 2));
+
+        let render = |frame: &mut Frame| {
+            frame.set_cursor_style(SetCursorStyle::SteadyBar);
+            frame.set_cursor_position((1, 0));
+            io::Result::Ok(())
+        };
+
+        terminal.try_draw(render).expect("first draw");
+        let after_first = terminal.backend().output();
+
+        terminal.try_draw(render).expect("second draw");
+        let after_second = terminal.backend().output();
+
+        assert_eq!(
+            after_first, after_second,
+            "an identical frame must not write to the terminal (output would clear the user's text selection)"
+        );
+    }
+
+    #[test]
+    fn changed_cursor_state_still_emits_output() {
+        let mut terminal =
+            Terminal::with_options(CaptureBackend::new(/*width*/ 4, /*height*/ 2))
+                .expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, 4, 2));
+
+        terminal
+            .try_draw(|frame| {
+                frame.set_cursor_style(SetCursorStyle::SteadyBar);
+                frame.set_cursor_position((1, 0));
+                io::Result::Ok(())
+            })
+            .expect("first draw");
+        let after_first = terminal.backend().output();
+
+        terminal
+            .try_draw(|frame| {
+                frame.set_cursor_style(SetCursorStyle::SteadyBlock);
+                frame.set_cursor_position((1, 0));
+                io::Result::Ok(())
+            })
+            .expect("second draw");
+        let after_second = terminal.backend().output();
+
+        assert_ne!(
+            after_first, after_second,
+            "a changed cursor style must still be written to the terminal"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "vendor-tests"))]
+mod tests {
+    use super::test_backend::CaptureBackend;
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use ratatui::layout::Rect;
+    use ratatui::style::Style;
 
     #[test]
     fn diff_buffers_does_not_emit_clear_to_end_for_full_width_row() {
@@ -897,7 +1012,7 @@ mod tests {
             .expect("cell should exist")
             .set_symbol("X");
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_buffers(&previous, &next, false);
 
         let clear_count = commands
             .iter()
@@ -924,7 +1039,7 @@ mod tests {
         previous.set_string(0, 0, "中文", Style::default());
         next.set_string(0, 0, "中", Style::default());
 
-        let commands = diff_buffers(&previous, &next);
+        let commands = diff_buffers(&previous, &next, false);
         assert!(
             commands
                 .iter()
