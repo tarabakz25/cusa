@@ -7,6 +7,7 @@
 use crate::codex_ui::custom_terminal;
 use crate::codex_ui::terminal_palette::set_default_colors_from_startup_probe;
 use crate::codex_adapter::terminal_probe;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -28,11 +29,12 @@ impl TerminalSession {
         let colors = terminal_probe::default_colors(terminal_probe::DEFAULT_TIMEOUT).ok().flatten();
         set_default_colors_from_startup_probe(colors);
         let mut stdout = io::stdout();
-        // Mouse capture is intentionally NOT enabled: no widget consumes
-        // mouse events, and capturing them blocks the terminal's native
-        // text selection, which is how users copy text out of the
-        // composer and transcript areas.
-        execute!(stdout, EnterAlternateScreen)?;
+        // Mouse capture drives tmux-style copy-on-select (PR #9): drag
+        // highlights a region and releasing the button copies it to the
+        // clipboard with a `copied …` toast — no Cmd+C needed. Native
+        // terminal selection stays reachable through the standard capture
+        // bypass (Shift+drag in most terminals, Option/Alt+drag in iTerm2).
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = custom_terminal::Terminal::with_options(backend)?;
         sync_viewport(&mut terminal)?;
@@ -47,7 +49,11 @@ impl TerminalSession {
     /// Tear down raw mode and restore the shell cursor.
     pub fn teardown(mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }

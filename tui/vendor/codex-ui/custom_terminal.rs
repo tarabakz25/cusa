@@ -301,6 +301,16 @@ where
         &mut self.buffers[1 - self.current]
     }
 
+    /// The most recently rendered frame.
+    ///
+    /// After `draw`/`try_draw` completes, `swap_buffers` resets the stale
+    /// buffer and flips the index, leaving the just-drawn frame in the
+    /// "previous" slot. Mouse copy-on-select reads the visible screen
+    /// content from here (PR #9).
+    pub fn last_frame_buffer(&self) -> &Buffer {
+        self.previous_buffer()
+    }
+
     /// Gets the backend
     pub const fn backend(&self) -> &B {
         &self.backend

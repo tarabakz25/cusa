@@ -12,6 +12,7 @@ pub mod login;
 pub mod mcp;
 pub mod model_picker;
 pub mod overlay;
+pub mod selection;
 pub mod skills;
 pub mod slash;
 pub mod startup;
@@ -63,6 +64,7 @@ trait RenderFrame {
     fn area(&self) -> Rect;
     fn render_widget<W: Widget>(&mut self, widget: W, area: Rect);
     fn place_composer_cursor(&mut self, pos: Option<(u16, u16)>);
+    fn frame_buffer_mut(&mut self) -> &mut ratatui::buffer::Buffer;
 }
 
 impl RenderFrame for ratatui::Frame<'_> {
@@ -75,6 +77,10 @@ impl RenderFrame for ratatui::Frame<'_> {
     }
 
     fn place_composer_cursor(&mut self, _pos: Option<(u16, u16)>) {}
+
+    fn frame_buffer_mut(&mut self) -> &mut ratatui::buffer::Buffer {
+        self.buffer_mut()
+    }
 }
 
 impl RenderFrame for crate::codex_ui::custom_terminal::Frame<'_> {
@@ -90,6 +96,10 @@ impl RenderFrame for crate::codex_ui::custom_terminal::Frame<'_> {
         if let Some((x, y)) = pos {
             self.set_cursor_position((x, y));
         }
+    }
+
+    fn frame_buffer_mut(&mut self) -> &mut ratatui::buffer::Buffer {
+        self.buffer_mut()
     }
 }
 
@@ -114,6 +124,11 @@ fn render_app_ui<F: RenderFrame>(state: &AppState, frame: &mut F) {
             frame.area(),
         );
         frame.place_composer_cursor(cursor);
+    }
+    // Copy-on-select (PR #9): overlay the drag selection on top of
+    // everything so the highlight tracks exactly what will be copied.
+    if let Some(sel) = &state.selection {
+        selection::highlight(frame.frame_buffer_mut(), sel);
     }
 }
 
@@ -354,6 +369,9 @@ pub fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> KeyOutcome {
+    // Any key press dismisses an active mouse selection (tmux-like):
+    // the content under the highlight is about to change.
+    state.selection = None;
     // Ctrl-C first, regardless of overlay.
     if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
         let outcome = state.on_ctrl_c(Instant::now());
@@ -421,6 +439,51 @@ pub fn handle_key(
     match result {
         ComposerKeyResult::Submit => submit_input(state, client),
         ComposerKeyResult::Handled => KeyOutcome::Handled,
+    }
+}
+
+/// Handle a mouse event in the interactive loop: tmux-style copy-on-select
+/// (PR #9). Dragging updates the highlight (the loop redraws after every
+/// event); releasing the button extracts the selected text from the last
+/// rendered frame and copies it — no explicit copy keystroke required.
+fn handle_mouse(
+    state: &mut AppState,
+    client: &SidecarClient,
+    terminal: &mut crate::terminal::InteractiveTerminal,
+    ev: crossterm::event::MouseEvent,
+) {
+    use crate::app::selection::MouseAction;
+    let area = terminal.viewport_area;
+    match selection::on_mouse_event(&mut state.selection, area, &ev) {
+        MouseAction::None | MouseAction::Redraw => {}
+        MouseAction::Copy(sel) => {
+            let text = selection::extract_text(terminal.last_frame_buffer(), &sel);
+            if text.trim().is_empty() {
+                return;
+            }
+            // Primary path: OSC 52 straight to the terminal. Works in
+            // iTerm2 / kitty / WezTerm / Alacritty / Windows Terminal and
+            // is forwarded across SSH and tmux (`set-clipboard`).
+            let osc = selection::osc52_sequence(&text);
+            let backend = terminal.backend_mut();
+            let _ = std::io::Write::write_all(backend, osc.as_bytes());
+            let _ = std::io::Write::flush(backend);
+            // Fallback: platform clipboard helper on a detached thread
+            // (covers terminals without OSC 52, e.g. macOS Terminal.app).
+            selection::spawn_system_clipboard_copy(text.clone());
+            state.overlay = Overlay::Toast {
+                message: selection::copied_toast_message(&text),
+                created: Instant::now(),
+            };
+        }
+        // Preserve the pre-capture "alternate scroll" behavior where the
+        // wheel produced arrow-key sequences in the alternate screen.
+        MouseAction::ScrollUp => {
+            let _ = handle_key(state, client, KeyCode::Up, KeyModifiers::empty());
+        }
+        MouseAction::ScrollDown => {
+            let _ = handle_key(state, client, KeyCode::Down, KeyModifiers::empty());
+        }
     }
 }
 
@@ -984,7 +1047,13 @@ async fn run_interactive_loop(
                             break;
                         }
                     }
+                    Some(TuiEvent::Term(CtEvent::Mouse(m))) => {
+                        handle_mouse(state, client, terminal, m);
+                    }
                     Some(TuiEvent::Term(CtEvent::Resize(_, _))) => {
+                        // Cell coordinates shift on resize; drop any active
+                        // selection instead of copying the wrong region.
+                        state.selection = None;
                         let _ = crate::terminal::TerminalSession::sync_viewport(terminal);
                     }
                     Some(_) => {}
@@ -1841,5 +1910,74 @@ mod tests {
         handle_key(&mut popup, &client, KeyCode::Tab, KeyModifiers::empty());
         assert_eq!(popup.session.approval_mode, before, "popup Tab must not cycle");
         assert_eq!(popup.input, "/help", "popup Tab completes the selection");
+    }
+
+    // ---- copy-on-select (PR #9) ----
+
+    #[test]
+    fn active_selection_renders_reversed_highlight_over_the_frame() {
+        let mut state = AppState::new("/tmp".into());
+        state.selection = Some(crate::app::selection::Selection {
+            anchor: (2, 1),
+            head: (6, 1),
+            dragged: true,
+        });
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw_to_buffer(&state, &mut terminal).unwrap();
+        let buf = terminal.backend().buffer();
+        let reversed = |x: u16, y: u16| {
+            buf.cell((x, y))
+                .expect("cell")
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        };
+        for x in 2..=6 {
+            assert!(reversed(x, 1), "cell ({x},1) must be highlighted");
+        }
+        assert!(!reversed(1, 1), "cell before anchor must not be highlighted");
+        assert!(!reversed(7, 1), "cell after head must not be highlighted");
+        assert!(!reversed(4, 3), "other rows must not be highlighted");
+    }
+
+    #[test]
+    fn selection_extracts_the_text_the_user_sees() {
+        let mut state = AppState::new("/tmp".into());
+        state.transcript.push(TranscriptEntry::User("hello copy".into()));
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw_to_buffer(&state, &mut terminal).unwrap();
+
+        // Locate the rendered message, then select exactly that region.
+        let buf = terminal.backend().buffer();
+        let mut found: Option<(u16, u16)> = None;
+        'outer: for y in 0..20u16 {
+            for x in 0..80u16 {
+                let mut s = String::new();
+                for dx in 0.."hello copy".len() as u16 {
+                    s.push_str(buf.cell((x + dx, y)).map(|c| c.symbol()).unwrap_or(""));
+                }
+                if s == "hello copy" {
+                    found = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        let (x, y) = found.expect("rendered transcript must contain the user message");
+        let sel = crate::app::selection::Selection {
+            anchor: (x, y),
+            head: (x + "hello copy".len() as u16 - 1, y),
+            dragged: true,
+        };
+        assert_eq!("hello copy", crate::app::selection::extract_text(buf, &sel));
+    }
+
+    #[tokio::test]
+    async fn any_key_press_clears_an_active_selection() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        state.selection = Some(crate::app::selection::Selection::new(1, 1));
+        handle_key(&mut state, &client, KeyCode::Char('a'), KeyModifiers::empty());
+        assert_eq!(None, state.selection, "typing must dismiss the highlight");
     }
 }
