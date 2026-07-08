@@ -61,6 +61,7 @@ impl<'a> Widget for StatusWidget<'a> {
 mod tests {
     use super::*;
     use crate::app::state::AppState;
+    use cusa_rpc::ModelSelection;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -106,7 +107,7 @@ mod tests {
     fn spec_016_status_line_shows_override_marker() {
         let mut s = AppState::new("/x".into());
         s.session.model = "claude-sonnet-4".into();
-        s.session.manual_model_override = Some("claude-sonnet-4".into());
+        s.session.manual_model_override = Some(ModelSelection::id_only("claude-sonnet-4"));
         let out = render_row(StatusWidget::new(&s), 100);
         assert!(out.contains("claude-sonnet-4"));
         assert!(out.contains("[override]"), "override marker missing: {out}");
