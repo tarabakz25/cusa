@@ -21,6 +21,10 @@ pub enum TranscriptEntry {
     },
     /// Observational tool decision entry (approve / deny / always).
     ToolDecision { tool: String, decision: String },
+    /// Model reasoning ("thinking") text streamed with `stream/message`
+    /// kind `reasoning`. Rendered visually distinct (dim + italic) from the
+    /// default assistant text so users can tell the two apart.
+    Reasoning { text: String },
     /// Assistant text (may span multiple lines).
     Assistant { text: String, model: String },
     /// Per-turn usage summary line.
@@ -48,6 +52,9 @@ pub enum TranscriptEntry {
 pub struct TurnState {
     pub prompt: String,
     pub assistant_text: String,
+    /// Reasoning ("thinking") deltas accumulated separately from the default
+    /// assistant text so the two can be displayed distinctly mid-flight.
+    pub reasoning_text: String,
     pub model: Option<String>,
     /// Sidecar-assigned run id captured from `router/decision`. Used by
     /// `session/cancel` to target the correct run (SPEC-004).
@@ -62,6 +69,7 @@ impl TurnState {
         Self {
             prompt,
             assistant_text: String::new(),
+            reasoning_text: String::new(),
             model: None,
             run_id: None,
             started_at: Some(std::time::Instant::now()),

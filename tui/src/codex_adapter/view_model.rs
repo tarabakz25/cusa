@@ -27,6 +27,12 @@ impl CusaViewModel {
             .collect();
 
         if let Some(turn) = live {
+            // Reasoning streams before the answer; keep that order visually.
+            if !turn.reasoning_text.is_empty() {
+                cells.push(HistoryCellView::LiveReasoning {
+                    text: turn.reasoning_text.clone(),
+                });
+            }
             if !turn.assistant_text.is_empty() {
                 cells.push(HistoryCellView::LiveAssistant {
                     text: turn.assistant_text.clone(),
@@ -83,6 +89,9 @@ impl CusaViewModel {
             TranscriptEntry::ToolDecision { tool, decision } => HistoryCellView::ToolDecision {
                 tool: tool.clone(),
                 decision: decision.clone(),
+            },
+            TranscriptEntry::Reasoning { text } => HistoryCellView::Reasoning {
+                text: text.clone(),
             },
             TranscriptEntry::Assistant { text, model } => HistoryCellView::Assistant {
                 text: text.clone(),
@@ -156,6 +165,42 @@ mod tests {
             HistoryCellView::LiveAssistant {
                 text: "partial".into()
             }
+        );
+    }
+
+    #[test]
+    fn history_cells_orders_live_reasoning_before_live_assistant() {
+        let entries = vec![TranscriptEntry::User("hi".into())];
+        let mut turn = TurnState::new("hi".into());
+        turn.reasoning_text = "thinking...".into();
+        turn.assistant_text = "partial answer".into();
+        let cells = CusaViewModel::history_cells(&entries, Some(&turn));
+        assert_eq!(cells.len(), 3);
+        assert_eq!(
+            cells[1],
+            HistoryCellView::LiveReasoning {
+                text: "thinking...".into()
+            }
+        );
+        assert_eq!(
+            cells[2],
+            HistoryCellView::LiveAssistant {
+                text: "partial answer".into()
+            }
+        );
+    }
+
+    #[test]
+    fn history_cells_maps_committed_reasoning_entry() {
+        let entries = vec![TranscriptEntry::Reasoning {
+            text: "step by step".into(),
+        }];
+        let cells = CusaViewModel::history_cells(&entries, None);
+        assert_eq!(
+            cells,
+            vec![HistoryCellView::Reasoning {
+                text: "step by step".into()
+            }]
         );
     }
 

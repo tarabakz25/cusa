@@ -82,6 +82,9 @@ pub enum HistoryCellView {
         source: RouterSourceView,
     },
     ToolDecision { tool: String, decision: String },
+    /// Committed model reasoning ("thinking") text, rendered distinctly
+    /// (dim + italic) from the default assistant text.
+    Reasoning { text: String },
     Assistant { text: String, model: String },
     TurnSummary { summary: String, model: String },
     ToolCall {
@@ -97,6 +100,9 @@ pub enum HistoryCellView {
     Note { message: String },
     /// In-flight assistant text not yet committed to the transcript.
     LiveAssistant { text: String },
+    /// In-flight reasoning ("thinking") text not yet committed to the
+    /// transcript.
+    LiveReasoning { text: String },
 }
 
 /// Bottom-pane composer state for ported `bottom_pane` widgets (P1+).

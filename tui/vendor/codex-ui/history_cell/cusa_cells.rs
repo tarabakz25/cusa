@@ -121,6 +121,56 @@ pub fn note_cell(message: String) -> PlainHistoryCell {
     ])])
 }
 
+/// Model reasoning ("thinking") text streamed via `stream/message` with
+/// kind `reasoning`. Rendered dim + italic under a "thinking" header so the
+/// model's internal reasoning is visually distinct from the default
+/// assistant answer text.
+#[derive(Debug)]
+pub struct ReasoningCell {
+    text: String,
+}
+
+impl ReasoningCell {
+    pub fn new(text: String) -> Self {
+        Self { text }
+    }
+}
+
+impl HistoryCell for ReasoningCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if self.text.trim().is_empty() {
+            return Vec::new();
+        }
+        let wrap_width = width.saturating_sub(2).max(1) as usize;
+        let body_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+            "thinking",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC | Modifier::DIM),
+        ))];
+        for src in self.text.lines() {
+            if src.trim().is_empty() {
+                lines.push(Line::from(""));
+                continue;
+            }
+            lines.extend(adaptive_wrap_lines(
+                [Line::from(Span::styled(src.to_string(), body_style))],
+                RtOptions::new(wrap_width),
+            ));
+        }
+        prefix_lines(lines, "✳ ".dim(), "  ".into())
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut out = vec![Line::from("thinking")];
+        out.extend(self.text.lines().map(|l| Line::from(l.to_string())));
+        out
+    }
+}
+
 /// Wrap plain assistant fallback text when markdown rendering is unavailable.
 #[derive(Debug)]
 pub struct PlainAssistantCell {
