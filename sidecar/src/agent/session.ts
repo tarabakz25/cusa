@@ -49,9 +49,22 @@ import { UsageAccumulator, TurnUsageTracker } from "../usage/accumulator.js";
 import { McpManager, type McpServerConfigMap } from "../mcp/index.js";
 import { SkillsManager } from "../skills/index.js";
 import { ContextManager } from "../context/index.js";
-import type { AgentHandle, SdkAdapter, TurnHandle } from "./sdkAdapter.js";
+import type {
+  AgentHandle,
+  SdkAdapter,
+  SendOptions,
+  TurnHandle,
+} from "./sdkAdapter.js";
 
 const CANCEL_SETTLE_MS = 3000;
+
+/**
+ * Default cap for `agent.send()` — the network call that establishes a run
+ * with the Cursor API. Without a bound, an unreachable backend leaves the
+ * caller of `session/send` waiting forever (the TUI shows an endless
+ * spinner; see issue #5).
+ */
+export const DEFAULT_SEND_TIMEOUT_MS = 60_000;
 
 export interface NotifyFn {
   (method: string, params: unknown): void;
@@ -75,6 +88,12 @@ export interface SessionManagerOptions {
    * with manual injection ON and no summarizer client is used.
    */
   context?: ContextManager;
+  /**
+   * Cap (ms) for `agent.send()` — the run-establishing network call to the
+   * Cursor API. Defaults to `DEFAULT_SEND_TIMEOUT_MS`. Tests inject small
+   * values to exercise the timeout path deterministically.
+   */
+  sendTimeoutMs?: number;
 }
 
 interface PendingApproval {
@@ -95,6 +114,14 @@ interface SessionState {
   activeRun: ActiveRunState | null;
   /** Tool names for which the user selected "always" this session. */
   alwaysApprovedTools: Set<string>;
+  /**
+   * Pending approval requests, keyed by requestId. Session-scoped (not
+   * run-scoped) on purpose: gating is observational, so a fast run can
+   * emit `run/finished` before the user's response arrives — an "always"
+   * decision must still seed `alwaysApprovedTools` in that case instead
+   * of being silently discarded.
+   */
+  pendingApprovals: Map<string, PendingApproval>;
   /** Enabled MCP server ids (subset of mcp/list). */
   enabledMcpServerIds: Set<string> | null;
   /** Cached one-time observational-approval warning flag. */
@@ -105,7 +132,6 @@ interface ActiveRunState {
   runId: string;
   turn: TurnHandle;
   turnUsage: TurnUsageTracker;
-  pendingApprovals: Map<string, PendingApproval>;
   effectiveModel: string | undefined;
   /** Text of the user prompt that started this run. */
   userPrompt: string;
@@ -142,6 +168,7 @@ export class SessionManager {
   private readonly skills: SkillsManager;
   private readonly mcp: McpManager;
   private readonly context: ContextManager;
+  private readonly sendTimeoutMs: number;
 
   constructor(opts: SessionManagerOptions) {
     this.adapter = opts.adapter;
@@ -152,6 +179,7 @@ export class SessionManager {
     this.skills = opts.skills ?? new SkillsManager({ log: this.log });
     this.mcp = opts.mcp ?? new McpManager({ log: this.log });
     this.context = opts.context ?? new ContextManager({ log: this.log });
+    this.sendTimeoutMs = opts.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
   }
 
   // -------- API key -----------------------------------------------------
@@ -226,6 +254,7 @@ export class SessionManager {
         currentModel: agent.model ?? params.model,
         activeRun: null,
         alwaysApprovedTools: new Set(),
+        pendingApprovals: new Map(),
         enabledMcpServerIds: null, // null = "all enabled"
         observationalWarnEmitted: false,
       };
@@ -288,16 +317,40 @@ export class SessionManager {
     let turn: TurnHandle;
     let runId: string;
 
+    // Events can start flowing the moment the adapter's turn exists —
+    // potentially before `session.activeRun` is assigned below (the gap
+    // spans several microtasks). Buffer them until the run is established
+    // so early deltas / tool calls are never silently dropped. If the send
+    // fails for good, flip to dropping so a ghost run that keeps streaming
+    // can never grow the buffer for its whole lifetime.
+    let earlyEvents: Array<import("./sdkAdapter.js").TurnEvent> | null = [];
+    let dropTurnEvents = false;
+
+    const sendOptions: SendOptions = {
+      modelOverride: modelForSend,
+      onEvent: (event) => {
+        if (dropTurnEvents) return;
+        if (earlyEvents !== null) {
+          earlyEvents.push(event);
+          return;
+        }
+        this.dispatchTurnEvent(session, event);
+      },
+    };
+    if (systemContext !== undefined) sendOptions.systemContext = systemContext;
+    if (mcpForTurn !== undefined) sendOptions.mcpServers = mcpForTurn;
+
     try {
-      const sendOptions: import("./sdkAdapter.js").SendOptions = {
-        modelOverride: modelForSend,
-        onEvent: (event) => this.dispatchTurnEvent(session, event),
-      };
-      if (systemContext !== undefined) sendOptions.systemContext = systemContext;
-      if (mcpForTurn !== undefined) sendOptions.mcpServers = mcpForTurn;
-      turn = await session.agent.send(params.text, sendOptions);
+      turn = await this.sendWithStaleRunRecovery(
+        session,
+        params.text,
+        sendOptions,
+      );
       runId = turn.runId;
     } catch (err) {
+      dropTurnEvents = true;
+      earlyEvents = null;
+      if (err instanceof SessionRpcError) throw err;
       throw this.wrapAgentError(err, "session/send failed");
     }
 
@@ -305,7 +358,6 @@ export class SessionManager {
       runId,
       turn,
       turnUsage: new TurnUsageTracker(),
-      pendingApprovals: new Map(),
       effectiveModel: modelForSend.id,
       userPrompt: params.text,
       assistantBuffer: [],
@@ -323,12 +375,156 @@ export class SessionManager {
       source: decision.source,
     });
 
+    // Flush events that raced ahead of run establishment (keeping them
+    // behind router/decision), then switch the handler to direct dispatch.
+    const buffered = earlyEvents;
+    earlyEvents = null;
+    for (const event of buffered) {
+      this.dispatchTurnEvent(session, event);
+    }
+
     // Fire and forget: consume the turn and emit finish/error events.
     // We intentionally do not await here — the sidecar returns runId to the
     // TUI immediately; final settlement is signalled via run/finished.
     void this.awaitTurn(session, active);
 
     return { runId };
+  }
+
+  /**
+   * `agent.send()` with automatic stale-run recovery (issue #5 follow-up).
+   *
+   * The SDK's local agent store persists `agent.activeRunId`, and `send()`
+   * refuses with "Agent <id> already has active run" while that run's
+   * record is non-terminal. The store has no staleness sweep, so a run
+   * whose process died mid-stream (crash, kill) or whose network phase
+   * hung (e.g. our own send timeout below — the SDK writes the run record
+   * *before* opening the stream) wedges the agent permanently: every
+   * subsequent send fails.
+   *
+   * SessionManager itself tracks at most one live run per session (the
+   * `activeRun` guard at the top of `sendMessage`), so when the SDK
+   * reports "busy" while we track no run, the recorded run is stale by
+   * definition. Recovery: cancel the stale record(s) in the store — which
+   * clears `activeRunId` — and retry the send exactly once.
+   */
+  private async sendWithStaleRunRecovery(
+    session: SessionState,
+    text: string,
+    sendOptions: SendOptions,
+  ): Promise<TurnHandle> {
+    try {
+      return await this.sendWithTimeout(session, text, sendOptions);
+    } catch (err) {
+      if (!isAgentBusyError(err)) throw err;
+      this.log(
+        "warn",
+        `agent ${session.agent.agentId} reports an active run but none is tracked — ` +
+          "cancelling stale run(s) in the local store and retrying",
+      );
+      let cancelledCount: number;
+      try {
+        cancelledCount = await this.adapter.cancelStaleRuns(
+          session.agent.agentId,
+          { cwd: session.cwd },
+        );
+      } catch (recoveryErr) {
+        const detail =
+          recoveryErr instanceof Error
+            ? recoveryErr.message
+            : String(recoveryErr);
+        throw new SessionRpcError(
+          RpcErrorCode.AgentError,
+          `session/send failed: ${(err as Error).message} — automatic ` +
+            `stale-run recovery failed (${detail}); start a fresh ` +
+            'session (relaunch cusa and pick "New session")',
+        );
+      }
+      this.log(
+        "info",
+        `stale-run recovery cancelled ${cancelledCount} run(s); retrying send`,
+      );
+      try {
+        return await this.sendWithTimeout(session, text, sendOptions);
+      } catch (retryErr) {
+        if (isAgentBusyError(retryErr)) {
+          throw new SessionRpcError(
+            RpcErrorCode.AgentError,
+            `session/send failed: ${(retryErr as Error).message} — the ` +
+              "agent is still busy after stale-run recovery (another " +
+              "process may be driving it); start a fresh session " +
+              '(relaunch cusa and pick "New session")',
+          );
+        }
+        throw retryErr;
+      }
+    }
+  }
+
+  /**
+   * Run `agent.send()` under a hard timeout (issue #5). `agent.send()` is a
+   * network call into the Cursor API; the SDK exposes no deadline for it, so
+   * an unreachable backend would otherwise park `session/send` forever and
+   * the TUI would spin with no error. We race the call against a timer and
+   * surface a typed RPC error when the budget is exhausted.
+   *
+   * The adapter-level `SendOptions.signal` is aborted on timeout so adapters
+   * that honour it (the fake does; the real SDK currently exposes no signal
+   * for `send`) stop early. If the underlying send settles *after* the
+   * timeout fired, the ghost run is cancelled best-effort and its rejection
+   * is swallowed so it never becomes an unhandled rejection.
+   */
+  private async sendWithTimeout(
+    session: SessionState,
+    text: string,
+    sendOptions: SendOptions,
+  ): Promise<TurnHandle> {
+    const controller = new AbortController();
+    sendOptions.signal = controller.signal;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let timedOut = false;
+
+    const sendPromise = session.agent.send(text, sendOptions);
+    // Reap a late-settling send: if the race below is lost to the timeout,
+    // the underlying promise may still settle afterwards. Cancel the ghost
+    // run best-effort and swallow any rejection so it never surfaces as an
+    // unhandled rejection.
+    void sendPromise
+      .then((turn) => {
+        if (timedOut) void turn.cancel().catch(() => {});
+      })
+      .catch(() => {});
+
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        // Reject *before* aborting: both settle in the same tick, and the
+        // race must surface the typed timeout error, not whatever the
+        // adapter throws in reaction to the abort.
+        reject(
+          new SessionRpcError(
+            RpcErrorCode.AgentError,
+            `session/send failed: agent.send() timed out after ${this.sendTimeoutMs} ms ` +
+              "(no response from the Cursor API — check network connectivity / try /model to probe)",
+          ),
+        );
+        controller.abort();
+      }, this.sendTimeoutMs);
+    });
+
+    try {
+      return await Promise.race([sendPromise, timeout]);
+    } catch (err) {
+      if (timedOut) {
+        this.log(
+          "warn",
+          `agent.send() timed out after ${this.sendTimeoutMs} ms for session ${session.sessionId}`,
+        );
+      }
+      throw err;
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
   }
 
   private async buildSystemContext(
@@ -399,7 +595,7 @@ export class SessionManager {
         }
         if (decision === "prompt") {
           const requestId = `appr_${randomUUID()}`;
-          active.pendingApprovals.set(requestId, {
+          session.pendingApprovals.set(requestId, {
             requestId,
             resolve: (final: ApprovalDecision) => {
               if (final === "always") {
@@ -610,6 +806,7 @@ export class SessionManager {
         currentModel: agent.model,
         activeRun: null,
         alwaysApprovedTools: new Set(),
+        pendingApprovals: new Map(),
         enabledMcpServerIds: null,
         observationalWarnEmitted: false,
       };
@@ -750,12 +947,10 @@ export class SessionManager {
     // is 1:1 with a session, but the schema does not bind the response to a
     // sessionId — we resolve by requestId only.
     for (const session of this.sessions.values()) {
-      const active = session.activeRun;
-      if (!active) continue;
-      const pending = active.pendingApprovals.get(params.requestId);
+      const pending = session.pendingApprovals.get(params.requestId);
       if (pending) {
         pending.resolve(params.decision);
-        active.pendingApprovals.delete(params.requestId);
+        session.pendingApprovals.delete(params.requestId);
         return { ok: true };
       }
     }
@@ -787,6 +982,17 @@ export class SessionManager {
       err instanceof Error ? `${prefix}: ${err.message}` : `${prefix}`;
     return new SessionRpcError(RpcErrorCode.AgentError, message);
   }
+}
+
+/**
+ * True when `err` is the SDK's "agent busy" rejection. The local-agent
+ * path throws a plain `Error` with this message (not `AgentBusyError`,
+ * which the cloud path uses for HTTP 409) — match both.
+ */
+function isAgentBusyError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === "AgentBusyError") return true;
+  return /already has (an )?active run/i.test(err.message);
 }
 
 function previewArgs(args: unknown): string {

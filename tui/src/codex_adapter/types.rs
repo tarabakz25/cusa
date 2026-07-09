@@ -47,7 +47,7 @@ impl ApprovalModeView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunPhaseView {
     Idle,
-    Routing,
+    Sending,
     Streaming,
     AwaitingApproval,
     Cancelling,
@@ -57,7 +57,7 @@ impl RunPhaseView {
     pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
-            Self::Routing => "routing",
+            Self::Sending => "sending",
             Self::Streaming => "streaming",
             Self::AwaitingApproval => "awaiting approval",
             Self::Cancelling => "cancelling",
@@ -67,7 +67,7 @@ impl RunPhaseView {
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            Self::Routing | Self::Streaming | Self::AwaitingApproval
+            Self::Sending | Self::Streaming | Self::AwaitingApproval
         )
     }
 }

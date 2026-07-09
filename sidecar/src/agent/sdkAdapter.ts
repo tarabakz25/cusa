@@ -108,6 +108,25 @@ export interface SdkAdapter {
   listModels(apiKey: string): Promise<ModelInfo[]>;
   createAgent(opts: CreateAgentOptions): Promise<AgentHandle>;
   resumeAgent(agentId: string, opts: ResumeAgentOptions): Promise<AgentHandle>;
+  /**
+   * Cancel every non-terminal run recorded for `agentId` in the SDK's
+   * *local agent store* and return how many were cancelled (issue #5
+   * follow-up).
+   *
+   * Background: the local store persists `agent.activeRunId`; `send()`
+   * refuses with "Agent <id> already has active run" while that run's
+   * record is non-terminal, and the SDK has no staleness sweep. A run
+   * whose process died or whose network stream hung therefore wedges the
+   * agent forever. Cancelling the stale record via the store clears
+   * `activeRunId` (verified against @cursor/sdk 1.0.x: the detached
+   * `run.cancel()` marks the run `cancelled` and resets the agent row to
+   * `idle`/`activeRunId: null`), after which `send()` works again.
+   *
+   * `cwd` must match the agent's persisted cwd — the local store scopes
+   * agent lookup by workspace and `listRuns` fails with "agent not
+   * found" otherwise.
+   */
+  cancelStaleRuns(agentId: string, opts: { cwd: string }): Promise<number>;
 }
 
 // ---------- Real adapter (thin wrapper around @cursor/sdk) ---------------
@@ -167,6 +186,41 @@ class RealSdkAdapter implements SdkAdapter {
       mcpServers: mcpServersFrom(opts.mcpOverrides),
     });
     return new RealAgentHandle(agent);
+  }
+
+  async cancelStaleRuns(
+    agentId: string,
+    opts: { cwd: string },
+  ): Promise<number> {
+    // Terminal statuses per the SDK's internal predicate ("finished" |
+    // "error" | "cancelled" | "expired"). Everything else can hold the
+    // agent's `activeRunId` and must be cancelled. The public RunStatus
+    // type omits "expired", so compare as strings.
+    const terminal = new Set<string>(["finished", "error", "cancelled", "expired"]);
+    let cancelled = 0;
+    let cursor: string | undefined;
+    do {
+      const page = await this.sdk.Agent.listRuns(agentId, {
+        runtime: "local",
+        cwd: opts.cwd,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+      for (const run of page.items) {
+        if (terminal.has(run.status)) continue;
+        try {
+          // Detached (store-loaded) handles support cancel without a live
+          // executor: it is a pure store mutation.
+          await run.cancel();
+          cancelled += 1;
+        } catch {
+          // Best-effort: a run that settles concurrently is fine; a run we
+          // cannot cancel will resurface as AgentBusy on the retry, which
+          // the caller reports with a /reset hint.
+        }
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== undefined);
+    return cancelled;
   }
 }
 

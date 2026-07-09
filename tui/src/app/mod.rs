@@ -300,6 +300,9 @@ pub fn apply_internal_event(state: &mut AppState, event: AppInternalEvent) {
         AppInternalEvent::ContextSetStrategy(result) => {
             context::apply_result(state, result);
         }
+        AppInternalEvent::SendPromptFailed(message) => {
+            state.on_send_failed(message);
+        }
     }
 }
 
@@ -765,18 +768,26 @@ fn submit_input(state: &mut AppState, client: &SidecarClient) -> KeyOutcome {
         return KeyOutcome::Handled;
     }
     let override_ = state.session.manual_model_override.clone();
+    let internal_tx = state.internal_tx.clone();
     state.begin_user_turn(text.clone());
-    spawn_send_prompt(client.clone(), session_id, text, override_);
+    spawn_send_prompt(client.clone(), session_id, text, override_, internal_tx);
     KeyOutcome::Handled
 }
 
 /// Fire a `session/send` request in a detached task (SPEC-016 injects the
 /// optional model override).
+///
+/// The RPC outcome is NOT discarded (issue #5): if the sidecar returns an
+/// error response (e.g. `NO_API_KEY`, `session/send failed`) or the call
+/// times out / loses transport, no `run/error` will ever arrive — the run
+/// was never established — so a `SendPromptFailed` internal event is pushed
+/// to surface the error in the transcript and return the phase to `Idle`.
 pub fn spawn_send_prompt(
     client: SidecarClient,
     session_id: String,
     text: String,
     model_override: Option<ModelSelection>,
+    internal_tx: Option<crate::app::internal::AppInternalTx>,
 ) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
@@ -788,13 +799,22 @@ pub fn spawn_send_prompt(
                 params["modelOverride"] = v;
             }
         }
-        let _ = client
+        let outcome = client
             .call(
                 cusa_rpc::method::SESSION_SEND,
                 Some(params),
                 std::time::Duration::from_secs(600),
             )
             .await;
+        let failure = match outcome {
+            Ok(response) => response
+                .error
+                .map(|e| format!("session/send failed (rpc error {}): {}", e.code, e.message)),
+            Err(err) => Some(format!("session/send failed: {err:#}")),
+        };
+        if let (Some(tx), Some(message)) = (internal_tx, failure) {
+            let _ = tx.send(AppInternalEvent::SendPromptFailed(message));
+        }
     });
 }
 
@@ -1935,6 +1955,75 @@ mod tests {
         handle_key(&mut popup, &client, KeyCode::Tab, KeyModifiers::empty());
         assert_eq!(popup.session.approval_mode, before, "popup Tab must not cycle");
         assert_eq!(popup.input, "/help", "popup Tab completes the selection");
+    }
+
+    // ----- issue #5: session/send failure handling ------------------------
+
+    /// End-to-end: a `session/send` RPC error response must produce a
+    /// `SendPromptFailed` internal event that, once applied, surfaces the
+    /// error and returns the phase to Idle instead of spinning forever.
+    #[tokio::test]
+    async fn issue_5_send_rpc_error_unlocks_ui_via_internal_event() {
+        let mut state = AppState::new("/tmp".into());
+        let (tx, mut rx) = internal_channel();
+        state.internal_tx = Some(tx.clone());
+        state.begin_user_turn("hello".into());
+        assert_eq!(state.phase, RunPhase::Sending);
+
+        let (client, mut peer) = SidecarClient::in_memory();
+        spawn_send_prompt(client, "s0".into(), "hello".into(), None, Some(tx));
+
+        // The sidecar side replies with an RPC error (e.g. NO_API_KEY).
+        let frame = peer.expect_frame().await;
+        let crate::sidecar::OutboundFrame::Value(v) = frame else {
+            panic!("expected a request frame");
+        };
+        assert_eq!(v["method"], "session/send");
+        let id: i64 = v["id"].as_i64().expect("request id");
+        peer.respond_err(
+            cusa_rpc::RequestId::Num(id),
+            -32001,
+            "CURSOR_API_KEY is not set. Run `cusa login` or export CURSOR_API_KEY.",
+        );
+
+        let event = rx.recv().await.expect("internal event must be emitted");
+        let AppInternalEvent::SendPromptFailed(ref msg) = event else {
+            panic!("expected SendPromptFailed, got {event:?}");
+        };
+        assert!(msg.contains("CURSOR_API_KEY"), "message carries the cause: {msg}");
+
+        apply_internal_event(&mut state, event);
+        assert_eq!(state.phase, RunPhase::Idle, "spinner must stop");
+        assert!(state.current_turn.is_none());
+        assert!(state
+            .transcript
+            .iter()
+            .any(|e| matches!(e, TranscriptEntry::Error(m) if m.contains("CURSOR_API_KEY"))));
+    }
+
+    /// A successful `session/send` response must NOT emit `SendPromptFailed`.
+    #[tokio::test]
+    async fn issue_5_send_rpc_success_emits_no_failure_event() {
+        let (tx, mut rx) = internal_channel();
+        let (client, mut peer) = SidecarClient::in_memory();
+        spawn_send_prompt(client, "s0".into(), "hi".into(), None, Some(tx));
+
+        let frame = peer.expect_frame().await;
+        let crate::sidecar::OutboundFrame::Value(v) = frame else {
+            panic!("expected a request frame");
+        };
+        let id: i64 = v["id"].as_i64().expect("request id");
+        peer.respond_ok(
+            cusa_rpc::RequestId::Num(id),
+            serde_json::json!({ "runId": "run-1" }),
+        );
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no internal event should fire on success"
+        );
     }
 
     // ---- copy-on-select (PR #9) ----
