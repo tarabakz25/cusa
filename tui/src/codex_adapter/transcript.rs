@@ -16,8 +16,8 @@ use crate::codex_adapter::types::{HistoryCellView, RouterSourceView};
 use crate::codex_adapter::view_model::CusaViewModel;
 use crate::codex_ui::history_cell::{
     self, tool_call_cell, tool_decision_cell, tool_result_cell, turn_summary_cell,
-    AgentMarkdownCell, HistoryCell, PlainAssistantCell, RouterSourceStyle, StreamingAgentTailCell,
-    UserHistoryCell, error_cell, note_cell, router_decision_cell,
+    AgentMarkdownCell, HistoryCell, PlainAssistantCell, ReasoningCell, RouterSourceStyle,
+    StreamingAgentTailCell, UserHistoryCell, error_cell, note_cell, router_decision_cell,
 };
 use crate::codex_ui::markdown;
 use crate::codex_ui::terminal_hyperlinks::HyperlinkLine;
@@ -107,6 +107,12 @@ fn view_to_cell(view: &HistoryCellView, cwd: &Path) -> Option<Arc<dyn HistoryCel
         )),
         HistoryCellView::ToolDecision { tool, decision } => {
             Arc::new(tool_decision_cell(tool.clone(), decision.clone()))
+        }
+        HistoryCellView::Reasoning { text } | HistoryCellView::LiveReasoning { text } => {
+            if text.trim().is_empty() {
+                return None;
+            }
+            Arc::new(ReasoningCell::new(text.clone()))
         }
         HistoryCellView::Assistant { text, .. } => {
             if text.trim().is_empty() {
@@ -270,6 +276,9 @@ mod tests {
                 model: "composer-2.5".into(),
                 rationale: "fast rule".into(),
                 source: RouterSource::Rule,
+            },
+            TranscriptEntry::Reasoning {
+                text: "considering the options".into(),
             },
             TranscriptEntry::Assistant {
                 text: "Here is **markdown** output.".into(),
@@ -495,8 +504,82 @@ mod tests {
             HistoryCellView::LiveAssistant {
                 text: "live".into(),
             },
+            HistoryCellView::Reasoning {
+                text: "committed thought".into(),
+            },
+            HistoryCellView::LiveReasoning {
+                text: "live thought".into(),
+            },
         ];
         let cells = views_to_transcript_cells(&views, Path::new("/tmp"));
         assert_eq!(cells.len(), views.len());
+    }
+
+    #[test]
+    fn reasoning_renders_before_assistant_answer() {
+        let entries: Vec<TranscriptEntry> = vec![
+            TranscriptEntry::Reasoning {
+                text: "weighing tradeoffs".into(),
+            },
+            TranscriptEntry::Assistant {
+                text: "the final answer".into(),
+                model: "composer-2.5".into(),
+            },
+        ];
+        let w = CodexTranscriptWidget::new(&entries, None, Path::new("/tmp"));
+        let out = render_widget(w, 60, 10);
+        let thinking_idx = out.find("thinking").expect("thinking header appears");
+        let reasoning_idx = out.find("weighing tradeoffs").expect("reasoning body appears");
+        let answer_idx = out.find("the final answer").expect("answer appears");
+        assert!(thinking_idx < reasoning_idx, "header precedes body: {out}");
+        assert!(reasoning_idx < answer_idx, "reasoning precedes answer: {out}");
+    }
+
+    #[test]
+    fn live_reasoning_streams_before_any_assistant_text() {
+        let entries = vec![TranscriptEntry::User("hi".into())];
+        let mut turn = TurnState::new("hi".into());
+        turn.reasoning_text = "still thinking".into();
+        let w = CodexTranscriptWidget::new(&entries, Some(&turn), Path::new("/tmp"));
+        let out = render_widget(w, 60, 8);
+        assert!(out.contains("thinking"), "{out}");
+        assert!(out.contains("still thinking"), "{out}");
+    }
+
+    #[test]
+    fn reasoning_cell_is_styled_dim_italic_distinct_from_assistant() {
+        use ratatui::style::{Color, Modifier};
+        let views = vec![HistoryCellView::Reasoning {
+            text: "quiet thought".into(),
+        }];
+        let cells = views_to_transcript_cells(&views, Path::new("/tmp"));
+        assert_eq!(cells.len(), 1);
+        let lines = cells[0].display_lines(60);
+        let header = &lines[0];
+        assert!(
+            header
+                .spans
+                .iter()
+                .any(|s| s.content.contains("thinking")
+                    && s.style.add_modifier.contains(Modifier::ITALIC)),
+            "header must carry italic 'thinking' label: {header:?}"
+        );
+        let body_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("quiet thought"))
+            .expect("body span present");
+        assert_eq!(body_span.style.fg, Some(Color::DarkGray));
+        assert!(body_span.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn empty_reasoning_views_are_skipped() {
+        let views = vec![
+            HistoryCellView::Reasoning { text: "  ".into() },
+            HistoryCellView::LiveReasoning { text: "".into() },
+        ];
+        let cells = views_to_transcript_cells(&views, Path::new("/tmp"));
+        assert!(cells.is_empty());
     }
 }

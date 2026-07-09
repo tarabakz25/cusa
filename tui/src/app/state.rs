@@ -9,7 +9,7 @@ use crate::app::overlay::Overlay;
 use crate::app::transcript::{TranscriptEntry, TurnState};
 use crate::app::usage::UsageAccumulator;
 use crate::session_store::SessionStore;
-use cusa_rpc::{ApprovalMode, ModelInfo, ModelSelection, RouterSource, TokenUsage};
+use cusa_rpc::{ApprovalMode, ModelInfo, ModelSelection, RouterSource, StreamTextKind, TokenUsage};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
@@ -318,10 +318,15 @@ impl AppState {
         }
     }
 
-    /// Called on every `stream/message` assistant delta.
-    pub fn on_stream_message(&mut self, delta: &str) {
+    /// Called on every `stream/message` delta. `kind` separates the default
+    /// assistant text from reasoning ("thinking") text so the two render
+    /// distinctly in the transcript.
+    pub fn on_stream_message(&mut self, delta: &str, kind: StreamTextKind) {
         let turn = self.current_turn.get_or_insert_with(|| TurnState::new(String::new()));
-        turn.assistant_text.push_str(delta);
+        match kind {
+            StreamTextKind::Assistant => turn.assistant_text.push_str(delta),
+            StreamTextKind::Reasoning => turn.reasoning_text.push_str(delta),
+        }
         if self.phase != RunPhase::Cancelling {
             self.phase = RunPhase::Streaming;
         }
@@ -340,6 +345,11 @@ impl AppState {
             .finish_turn_with_model(usage, Some(&effective_model));
         if let Some(mut turn) = self.current_turn.take() {
             turn.model = model.or(Some(self.session.model.clone()));
+            let reasoning = std::mem::take(&mut turn.reasoning_text);
+            if !reasoning.trim().is_empty() {
+                self.transcript
+                    .push(TranscriptEntry::Reasoning { text: reasoning });
+            }
             let text = std::mem::take(&mut turn.assistant_text);
             let model_label = turn.model.clone().unwrap_or_default();
             self.transcript.push(TranscriptEntry::Assistant {
@@ -486,9 +496,61 @@ mod tests {
         let mut s = AppState::new("/tmp".into());
         s.begin_user_turn("hi".into());
         s.on_router_decision("m".into(), "r".into(), "run-1".into(), RouterSource::Rule);
-        s.on_stream_message("Hel");
-        s.on_stream_message("lo");
+        s.on_stream_message("Hel", StreamTextKind::Assistant);
+        s.on_stream_message("lo", StreamTextKind::Assistant);
         assert_eq!(s.current_turn.as_ref().unwrap().assistant_text, "Hello");
+    }
+
+    #[test]
+    fn stream_reasoning_accumulates_separately_from_assistant_text() {
+        let mut s = AppState::new("/tmp".into());
+        s.begin_user_turn("hi".into());
+        s.on_router_decision("m".into(), "r".into(), "run-1".into(), RouterSource::Rule);
+        s.on_stream_message("plan ", StreamTextKind::Reasoning);
+        s.on_stream_message("steps", StreamTextKind::Reasoning);
+        s.on_stream_message("answer", StreamTextKind::Assistant);
+        let turn = s.current_turn.as_ref().unwrap();
+        assert_eq!(turn.reasoning_text, "plan steps");
+        assert_eq!(turn.assistant_text, "answer");
+    }
+
+    #[test]
+    fn run_finished_commits_reasoning_entry_before_assistant() {
+        let mut s = AppState::new("/tmp".into());
+        s.begin_user_turn("hi".into());
+        s.on_router_decision("m".into(), "r".into(), "run-1".into(), RouterSource::Rule);
+        s.on_stream_message("thinking about it", StreamTextKind::Reasoning);
+        s.on_stream_message("final answer", StreamTextKind::Assistant);
+        s.on_run_finished(Some("m".into()), &TokenUsage::default());
+        let reasoning_idx = s
+            .transcript
+            .iter()
+            .position(|e| matches!(e, TranscriptEntry::Reasoning { text } if text == "thinking about it"))
+            .expect("reasoning entry committed");
+        let assistant_idx = s
+            .transcript
+            .iter()
+            .position(|e| matches!(e, TranscriptEntry::Assistant { text, .. } if text == "final answer"))
+            .expect("assistant entry committed");
+        assert!(
+            reasoning_idx < assistant_idx,
+            "reasoning must precede the assistant answer"
+        );
+    }
+
+    #[test]
+    fn run_finished_skips_empty_reasoning_entry() {
+        let mut s = AppState::new("/tmp".into());
+        s.begin_user_turn("hi".into());
+        s.on_stream_message("   \n", StreamTextKind::Reasoning);
+        s.on_stream_message("answer", StreamTextKind::Assistant);
+        s.on_run_finished(Some("m".into()), &TokenUsage::default());
+        assert!(
+            !s.transcript
+                .iter()
+                .any(|e| matches!(e, TranscriptEntry::Reasoning { .. })),
+            "whitespace-only reasoning must not be committed"
+        );
     }
 
     #[test]
@@ -496,7 +558,7 @@ mod tests {
         let mut s = AppState::new("/tmp".into());
         s.begin_user_turn("hi".into());
         s.on_router_decision("m".into(), "r".into(), "run-2".into(), RouterSource::Rule);
-        s.on_stream_message("out");
+        s.on_stream_message("out", StreamTextKind::Assistant);
         let final_usage = TokenUsage {
             input_tokens: 10,
             output_tokens: 20,

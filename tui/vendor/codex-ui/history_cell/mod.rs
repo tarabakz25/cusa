@@ -43,7 +43,7 @@ mod messages;
 pub(crate) use base::*;
 pub(crate) use cusa_cells::{
     error_cell, note_cell, router_decision_cell, tool_call_cell, tool_decision_cell,
-    tool_result_cell, turn_summary_cell, PlainAssistantCell, RouterSourceStyle,
+    tool_result_cell, turn_summary_cell, PlainAssistantCell, ReasoningCell, RouterSourceStyle,
 };
 pub(crate) use messages::*;
 

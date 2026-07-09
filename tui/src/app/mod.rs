@@ -177,7 +177,7 @@ fn apply_notification(state: &mut AppState, client: &SidecarClient, n: ServerNot
             state.on_router_decision(p.model, p.rationale, p.run_id, p.source);
         }
         ServerNotification::StreamMessage(p) => {
-            state.on_stream_message(&p.delta);
+            state.on_stream_message(&p.delta, p.kind);
         }
         ServerNotification::StreamToolCall(p) => {
             state.transcript.push(TranscriptEntry::ToolCall {
@@ -1238,7 +1238,7 @@ mod tests {
             RouterSource::Rule,
         );
         for delta in ["Hel", "lo, ", "world."] {
-            state.on_stream_message(delta);
+            state.on_stream_message(delta, StreamTextKind::Assistant);
         }
         let usage = cusa_rpc::TokenUsage {
             input_tokens: 10,
@@ -1397,6 +1397,38 @@ mod tests {
             );
         }
         assert_eq!(state.current_turn.as_ref().unwrap().assistant_text, "abc");
+    }
+
+    #[tokio::test]
+    async fn stream_message_reasoning_kind_routes_to_reasoning_text() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        state.begin_user_turn("hi".into());
+        apply_sidecar_event(
+            &mut state,
+            &client,
+            SidecarEvent::Notification(ServerNotification::StreamMessage(
+                StreamMessageParams {
+                    run_id: "r".into(),
+                    delta: "let me think".into(),
+                    kind: StreamTextKind::Reasoning,
+                },
+            )),
+        );
+        apply_sidecar_event(
+            &mut state,
+            &client,
+            SidecarEvent::Notification(ServerNotification::StreamMessage(
+                StreamMessageParams {
+                    run_id: "r".into(),
+                    delta: "the answer".into(),
+                    kind: StreamTextKind::Assistant,
+                },
+            )),
+        );
+        let turn = state.current_turn.as_ref().unwrap();
+        assert_eq!(turn.reasoning_text, "let me think");
+        assert_eq!(turn.assistant_text, "the answer");
     }
 
     #[tokio::test]
