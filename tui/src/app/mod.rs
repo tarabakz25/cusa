@@ -25,8 +25,8 @@ use crate::app::events::{spawn_input, TuiEvent};
 use crate::codex_adapter::{BottomPaneWidget, ComposerKeyResult, handle_composer_key};
 use crate::app::internal::{channel as internal_channel, AppInternalEvent, AppInternalRx};
 use crate::app::overlay::{
-    cycle_approval_mode, ApprovalPickerOverlay, McpOverlay, ModelPickerOverlay, Overlay,
-    OverlayWidget, SkillsOverlay,
+    cycle_approval_mode, ApprovalPickerOverlay, McpOverlay, ModelPickerFocus,
+    ModelPickerOverlay, Overlay, OverlayWidget, SkillsOverlay,
 };
 use crate::app::slash::SlashCommand;
 use crate::app::state::{AppState, CtrlCOutcome, RunPhase, SidecarStatusView};
@@ -36,7 +36,7 @@ use crate::sidecar::events::{SidecarEvent, SidecarStatus};
 use crate::sidecar::SidecarClient;
 use anyhow::Result;
 use crossterm::event::{Event as CtEvent, KeyCode, KeyModifiers};
-use cusa_rpc::{ApprovalMode, RunFinishedParams, ServerNotification};
+use cusa_rpc::{ApprovalMode, ModelSelection, RunFinishedParams, ServerNotification};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::widgets::Widget;
@@ -600,19 +600,40 @@ fn handle_model_picker_key(state: &mut AppState, code: KeyCode) -> KeyOutcome {
                 overlay.move_down();
             }
         }
-        KeyCode::Enter => {
-            let selected_id = {
-                if let Overlay::ModelPicker(overlay) = &state.overlay {
-                    overlay.selected().map(|m| m.id.clone())
+        KeyCode::Left => {
+            if let Overlay::ModelPicker(overlay) = &mut state.overlay {
+                if overlay.focus == ModelPickerFocus::Parameters {
+                    overlay.cycle_param_value(-1);
                 } else {
-                    None
+                    overlay.focus_models();
                 }
+            }
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            if let Overlay::ModelPicker(overlay) = &mut state.overlay {
+                if overlay.focus == ModelPickerFocus::Parameters {
+                    overlay.cycle_param_value(1);
+                } else {
+                    overlay.focus_parameters();
+                }
+            }
+        }
+        KeyCode::BackTab => {
+            if let Overlay::ModelPicker(overlay) = &mut state.overlay {
+                overlay.focus_models();
+            }
+        }
+        KeyCode::Enter => {
+            let selection = if let Overlay::ModelPicker(overlay) = &state.overlay {
+                overlay.build_selection()
+            } else {
+                None
             };
-            if let Some(id) = selected_id {
-                if id == "auto" {
+            if let Some(sel) = selection {
+                if sel.id == "auto" {
                     clear_model_override(state);
                 } else {
-                    set_model_override(state, id);
+                    set_model_override(state, sel);
                 }
                 state.overlay = Overlay::None;
             }
@@ -755,7 +776,7 @@ pub fn spawn_send_prompt(
     client: SidecarClient,
     session_id: String,
     text: String,
-    model_override: Option<String>,
+    model_override: Option<ModelSelection>,
 ) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
@@ -763,7 +784,9 @@ pub fn spawn_send_prompt(
     tokio::spawn(async move {
         let mut params = serde_json::json!({ "sessionId": session_id, "text": text });
         if let Some(m) = model_override {
-            params["modelOverride"] = serde_json::Value::String(m);
+            if let Ok(v) = serde_json::to_value(m) {
+                params["modelOverride"] = v;
+            }
         }
         let _ = client
             .call(
@@ -892,7 +915,7 @@ fn dispatch_model(
             clear_model_override(state);
         }
         Some(id) => {
-            set_model_override(state, id.to_string());
+            set_model_override(state, ModelSelection::id_only(id.to_string()));
         }
     }
     KeyOutcome::Handled
@@ -934,11 +957,12 @@ fn dispatch_approval(state: &mut AppState, arg: Option<String>) -> KeyOutcome {
     KeyOutcome::Handled
 }
 
-fn set_model_override(state: &mut AppState, id: String) {
-    state.session.manual_model_override = Some(id.clone());
-    state.session.model = id.clone();
+fn set_model_override(state: &mut AppState, selection: ModelSelection) {
+    let label = model_picker::format_model_label(&selection, state.models_cache.as_deref());
+    state.session.manual_model_override = Some(selection);
+    state.session.model = label.clone();
     state.overlay = Overlay::Toast {
-        message: format!("model override: {id}"),
+        message: format!("model override: {label}"),
         created: Instant::now(),
     };
 }
@@ -1239,7 +1263,7 @@ mod tests {
     async fn spec_002_reset_slash_disposes_session_and_records_note() {
         let mut state = AppState::new("/tmp".into());
         state.session.session_id = Some("gone".into());
-        state.session.manual_model_override = Some("claude-sonnet-4".into());
+        state.session.manual_model_override = Some(ModelSelection::id_only("claude-sonnet-4"));
         state.always_approved_tools.insert("shell".into());
         let (client, mut peer) = SidecarClient::in_memory();
         dispatch_slash(&mut state, &client, SlashCommand::Reset);
@@ -1400,7 +1424,7 @@ mod tests {
             SlashCommand::Model(Some("claude-sonnet-4".into())),
         );
         assert_eq!(
-            state.session.manual_model_override.as_deref(),
+            state.session.manual_model_override.as_ref().map(|m| m.id.as_str()),
             Some("claude-sonnet-4")
         );
         state.overlay = Overlay::None;
@@ -1415,7 +1439,7 @@ mod tests {
         let frame = peer.try_recv_outbound().expect("session/send fired");
         if let crate::sidecar::OutboundFrame::Value(v) = frame {
             assert_eq!(v["method"], "session/send");
-            assert_eq!(v["params"]["modelOverride"], "claude-sonnet-4");
+            assert_eq!(v["params"]["modelOverride"]["id"], "claude-sonnet-4");
             assert_eq!(v["params"]["text"], "hello");
         } else {
             panic!("unexpected frame type");
@@ -1425,7 +1449,7 @@ mod tests {
     #[tokio::test]
     async fn spec_016_slash_model_auto_clears_override() {
         let mut state = AppState::new("/tmp".into());
-        state.session.manual_model_override = Some("claude-sonnet-4".into());
+        state.session.manual_model_override = Some(ModelSelection::id_only("claude-sonnet-4"));
         let (client, _peer) = SidecarClient::in_memory();
         dispatch_slash(
             &mut state,
@@ -1451,6 +1475,7 @@ mod tests {
                 display_name: None,
                 provider: None,
                 supports_thinking: false,
+                parameters: vec![],
             }])),
         );
         if let Overlay::ModelPicker(overlay) = &state.overlay {

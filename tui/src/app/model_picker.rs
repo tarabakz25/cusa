@@ -7,15 +7,48 @@ use crate::app::internal::AppInternalEvent;
 use crate::app::overlay::{ModelPickerOverlay, Overlay};
 use crate::app::state::AppState;
 use crate::sidecar::SidecarClient;
-use cusa_rpc::{ModelInfo, ModelsListResult};
+use cusa_rpc::{ModelInfo, ModelSelection, ModelsListResult};
 use std::time::Duration;
+
+/// Human-readable model label for status chrome and toasts.
+pub fn format_model_label(selection: &ModelSelection, models: Option<&[ModelInfo]>) -> String {
+    let model_meta = models.and_then(|ms| ms.iter().find(|m| m.id == selection.id));
+    let base = model_meta
+        .and_then(|m| m.display_name.as_deref())
+        .unwrap_or(selection.id.as_str());
+    if selection.params.is_empty() {
+        return base.to_string();
+    }
+    let mut parts = vec![base.to_string()];
+    for param in &selection.params {
+        let label = model_meta
+            .and_then(|m| m.parameters.iter().find(|d| d.id == param.id))
+            .and_then(|def| {
+                def.values
+                    .iter()
+                    .find(|v| v.value == param.value)
+                    .and_then(|v| v.display_name.as_deref())
+            })
+            .unwrap_or(param.value.as_str());
+        parts.push(label.to_string());
+    }
+    parts.join(" ")
+}
+
+fn populated_picker(state: &AppState, models: Vec<ModelInfo>) -> ModelPickerOverlay {
+    let mut picker = ModelPickerOverlay::populated(models);
+    if let Some(existing) = &state.session.manual_model_override {
+        picker.restore_selection(existing);
+    }
+    picker
+}
 
 /// Open the `/model` picker. If the models list is cached, populate the
 /// overlay directly; otherwise show a "loading…" state and dispatch a
 /// `models/list` request.
 pub fn open(state: &mut AppState, client: &SidecarClient) {
     if let Some(models) = state.models_cache.clone() {
-        state.overlay = Overlay::ModelPicker(ModelPickerOverlay::populated(models));
+        state.overlay = Overlay::ModelPicker(populated_picker(state, models));
         return;
     }
     state.overlay = Overlay::ModelPicker(ModelPickerOverlay::loading());
@@ -57,7 +90,7 @@ pub fn apply_list_response(state: &mut AppState, result: Result<Vec<ModelInfo>, 
         Ok(models) => {
             state.models_cache = Some(models.clone());
             if matches!(state.overlay, Overlay::ModelPicker(_)) {
-                state.overlay = Overlay::ModelPicker(ModelPickerOverlay::populated(models));
+                state.overlay = Overlay::ModelPicker(populated_picker(state, models));
             }
         }
         Err(err) => {
@@ -66,5 +99,46 @@ pub fn apply_list_response(state: &mut AppState, result: Result<Vec<ModelInfo>, 
                 overlay.error = Some(format!("models/list failed: {err}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cusa_rpc::{ModelParameterDefinition, ModelParameterValue, ModelParameterValueOption};
+
+    #[test]
+    fn format_model_label_includes_param_display_names() {
+        let models = [ModelInfo {
+            id: "composer-2.5".into(),
+            display_name: Some("Composer 2.5".into()),
+            provider: None,
+            supports_thinking: false,
+            parameters: vec![ModelParameterDefinition {
+                id: "effort".into(),
+                display_name: Some("Effort".into()),
+                values: vec![
+                    ModelParameterValueOption {
+                        value: "high".into(),
+                        display_name: Some("High".into()),
+                    },
+                    ModelParameterValueOption {
+                        value: "low".into(),
+                        display_name: None,
+                    },
+                ],
+            }],
+        }];
+        let sel = ModelSelection {
+            id: "composer-2.5".into(),
+            params: vec![ModelParameterValue {
+                id: "effort".into(),
+                value: "high".into(),
+            }],
+        };
+        assert_eq!(
+            format_model_label(&sel, Some(&models)),
+            "Composer 2.5 High"
+        );
     }
 }
