@@ -9,7 +9,7 @@ use crate::app::overlay::Overlay;
 use crate::app::transcript::{TranscriptEntry, TurnState};
 use crate::app::usage::UsageAccumulator;
 use crate::session_store::SessionStore;
-use cusa_rpc::{ApprovalMode, ModelInfo, RouterSource, TokenUsage};
+use cusa_rpc::{ApprovalMode, ModelInfo, ModelSelection, RouterSource, TokenUsage};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
@@ -78,7 +78,7 @@ pub struct SessionView {
     /// SPEC-016: sticky manual model override. When `Some`, subsequent
     /// `session/send` calls carry a `modelOverride` field and the router is
     /// bypassed on the sidecar side.
-    pub manual_model_override: Option<String>,
+    pub manual_model_override: Option<ModelSelection>,
     /// SPEC-032: ids of skills the user has enabled for this session.
     pub enabled_skill_ids: Vec<String>,
 }
@@ -199,6 +199,10 @@ pub struct AppState {
     /// SPEC-002: true when the user dismissed the popup with Esc for the
     /// current input. Re-armed on the next edit.
     pub slash_popup_dismissed: bool,
+    /// Active mouse drag selection (tmux-style copy-on-select, PR #9).
+    /// Rendered as a REVERSED overlay; releasing the button copies the
+    /// covered text and clears this.
+    pub selection: Option<crate::app::selection::Selection>,
 }
 
 impl AppState {
@@ -237,6 +241,7 @@ impl AppState {
             composer_input_active: false,
             slash_popup_selected: 0,
             slash_popup_dismissed: false,
+            selection: None,
         }
     }
 

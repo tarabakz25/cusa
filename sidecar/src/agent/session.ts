@@ -235,7 +235,7 @@ export class SessionManager {
     try {
       const agent = await this.adapter.createAgent({
         cwd: params.cwd,
-        model: params.model,
+        model: params.model ? { id: params.model } : undefined,
         approvalMode,
         settingSources: params.settingSources ?? ["user", "project"],
         mcpOverrides: composedMcp,
@@ -297,13 +297,13 @@ export class SessionManager {
       routeCtx.defaultModel = session.defaultModel;
     }
     if (params.modelOverride !== undefined) {
-      routeCtx.sessionManualModel = params.modelOverride;
+      routeCtx.sessionManualModel = params.modelOverride.id;
     }
     if (session.enabledSkillIds.length > 0) {
       routeCtx.enabledSkills = [...session.enabledSkillIds];
     }
     const decision = await this.router.route(routeCtx);
-    const effectiveModel = decision.model;
+    const modelForSend = params.modelOverride ?? { id: decision.model };
 
     // Build the system-context block (skills + conversation history) and
     // compose the per-turn MCP server map (inline replaces creation-time).
@@ -327,7 +327,7 @@ export class SessionManager {
     let dropTurnEvents = false;
 
     const sendOptions: SendOptions = {
-      modelOverride: effectiveModel,
+      modelOverride: modelForSend,
       onEvent: (event) => {
         if (dropTurnEvents) return;
         if (earlyEvents !== null) {
@@ -358,7 +358,7 @@ export class SessionManager {
       runId,
       turn,
       turnUsage: new TurnUsageTracker(),
-      effectiveModel,
+      effectiveModel: modelForSend.id,
       userPrompt: params.text,
       assistantBuffer: [],
       toolCallsSummary: [],
@@ -370,7 +370,7 @@ export class SessionManager {
     this.notify(Method.RouterDecision, {
       sessionId: session.sessionId,
       runId,
-      model: effectiveModel,
+      model: modelForSend.id,
       rationale: decision.rationale,
       source: decision.source,
     });

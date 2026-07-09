@@ -15,7 +15,7 @@ import type {
   TurnHandle,
   TurnResult,
 } from "./sdkAdapter.js";
-import type { ModelInfo } from "../rpc/schema.js";
+import type { ModelInfo, ModelSelection } from "../rpc/schema.js";
 
 export type TurnScript = {
   events: TurnEvent[];
@@ -52,7 +52,7 @@ export interface FakeAdapterState {
   sendCalls: Array<{
     agentId: string;
     text: string;
-    modelOverride?: string;
+    modelOverride?: ModelSelection;
     systemContext?: string;
     mcpServers?: Record<string, unknown>;
   }>;
@@ -63,7 +63,29 @@ export interface FakeAdapterState {
 export class FakeSdkAdapter implements SdkAdapter {
   readonly state: FakeAdapterState = {
     models: [
-      { id: "composer-2.5", displayName: "Composer 2.5" },
+      {
+        id: "composer-2.5",
+        displayName: "Composer 2.5",
+        parameters: [
+          {
+            id: "effort",
+            displayName: "Effort",
+            values: [
+              { value: "low", displayName: "Low" },
+              { value: "medium", displayName: "Medium" },
+              { value: "high", displayName: "High" },
+            ],
+          },
+          {
+            id: "fast",
+            displayName: "Fast",
+            values: [
+              { value: "false", displayName: "Off" },
+              { value: "true", displayName: "On" },
+            ],
+          },
+        ],
+      },
       { id: "claude-sonnet-4", displayName: "Claude Sonnet 4" },
     ],
     listModelsKeys: [],
@@ -142,11 +164,11 @@ class FakeAgentHandle implements AgentHandle {
   constructor(
     private readonly adapter: FakeSdkAdapter,
     public readonly agentId: string,
-    private _model: string | undefined,
+    private _model: ModelSelection | undefined,
   ) {}
 
   get model(): string | undefined {
-    return this._model;
+    return this._model?.id;
   }
 
   async send(text: string, opts: SendOptions): Promise<TurnHandle> {
@@ -184,7 +206,7 @@ class FakeAgentHandle implements AgentHandle {
       result: { status: "finished" },
     };
     const runId = `fake-run-${this.adapter.state.nextRunId++}`;
-    const effectiveModel = opts.modelOverride ?? this._model;
+    const effectiveModel = opts.modelOverride?.id ?? this._model?.id;
     if (opts.modelOverride) {
       this._model = opts.modelOverride;
     }

@@ -343,7 +343,7 @@ test("SPEC-071: SessionManager wires session/create → adapter.createAgent with
   });
   assert.equal(adapter.state.createCalls.length, 1);
   const call = adapter.state.createCalls[0]!;
-  assert.equal(call.model, "composer-2.5");
+  assert.deepEqual(call.model, { id: "composer-2.5" });
   assert.equal(call.approvalMode, "full-auto");
   assert.deepEqual(call.settingSources, ["user", "project"]);
   assert.equal(call.apiKey, "sk_test");
