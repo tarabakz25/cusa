@@ -28,27 +28,42 @@ impl Frame {
 }
 
 /// Read the next newline-delimited JSON frame. Returns `Ok(None)` on EOF.
+///
+/// Non-JSON lines are skipped (with a warn). `@cursor/sdk` occasionally
+/// writes human INFO lines to the process stdout — the same fd we use for
+/// JSON-RPC. Treating those as fatal used to tear down the reader, leave
+/// the pipe unread, and back-pressure the sidecar into a hung
+/// `run.wait()` (endless TUI "Working").
 pub async fn read_frame<R>(reader: &mut BufReader<R>) -> Result<Option<Frame>>
 where
     R: AsyncRead + Unpin,
 {
-    let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
-        .await
-        .context("read from sidecar stdout")?;
-    if n == 0 {
-        return Ok(None);
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("read from sidecar stdout")?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            // Ignore blank lines rather than failing parse; they can appear
+            // from CRLF terminals.
+            continue;
+        }
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(v) => return Ok(Some(Frame(v))),
+            Err(err) => {
+                tracing::warn!(
+                    target: "sidecar",
+                    "skipping non-json stdout line from sidecar: {err:#} ({trimmed:.200})"
+                );
+                continue;
+            }
+        }
     }
-    let trimmed = line.trim_end_matches(['\n', '\r']);
-    if trimmed.is_empty() {
-        // Ignore blank lines rather than failing parse; they can appear
-        // from CRLF terminals.
-        return Ok(Some(Frame(Value::Null)));
-    }
-    let v: Value = serde_json::from_str(trimmed)
-        .with_context(|| format!("parse json frame: {trimmed:.200}"))?;
-    Ok(Some(Frame(v)))
 }
 
 /// Write a JSON value as a single newline-terminated frame.
@@ -171,5 +186,50 @@ mod tests {
         let mut reader = BufReader::new(a);
         let frame = read_frame(&mut reader).await.unwrap();
         assert!(frame.is_none());
+    }
+
+    #[tokio::test]
+    async fn skips_non_json_stdout_noise_from_sdk() {
+        let (a, mut b) = tokio::io::duplex(8192);
+        let mut reader = BufReader::new(a);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            b.write_all(
+                b"05:16:08.850 INFO  LocalCursorRulesService load completed meta={durationMs: 26}\n",
+            )
+            .await
+            .unwrap();
+            let notif: Notification<StreamMessageParams> = Notification {
+                jsonrpc: "2.0".into(),
+                method: method::STREAM_MESSAGE.into(),
+                params: Some(StreamMessageParams {
+                    run_id: "r1".into(),
+                    delta: "hi".into(),
+                    kind: StreamTextKind::Assistant,
+                }),
+            };
+            write_frame(&mut b, &serde_json::to_value(&notif).unwrap())
+                .await
+                .unwrap();
+        });
+        let frame = read_frame(&mut reader).await.unwrap().unwrap();
+        let back: Notification<StreamMessageParams> =
+            serde_json::from_value(frame.into_value()).expect("deserialize");
+        assert_eq!(back.params.unwrap().delta, "hi");
+    }
+
+    #[tokio::test]
+    async fn blank_lines_are_skipped_not_returned_as_null() {
+        let (a, mut b) = tokio::io::duplex(4096);
+        let mut reader = BufReader::new(a);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            b.write_all(b"\n\n").await.unwrap();
+            write_frame(&mut b, &serde_json::json!({"jsonrpc":"2.0","method":"log","params":{}}))
+                .await
+                .unwrap();
+        });
+        let frame = read_frame(&mut reader).await.unwrap().unwrap();
+        assert_eq!(frame.into_value()["method"], "log");
     }
 }
