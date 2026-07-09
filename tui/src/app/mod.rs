@@ -12,6 +12,7 @@ pub mod login;
 pub mod mcp;
 pub mod model_picker;
 pub mod overlay;
+pub mod resume;
 pub mod selection;
 pub mod skills;
 pub mod slash;
@@ -62,13 +63,17 @@ pub fn compute_layout(area: Rect, state: &AppState) -> [Rect; 2] {
 /// Wheel step for transcript scrollback, matching the ~3-line arrow bursts
 /// terminals emit per notch in "alternate scroll" mode.
 const WHEEL_SCROLL_LINES: isize = 3;
+/// Maximum wheel notches applied from one coalesced input burst. This keeps
+/// high-resolution trackpads from jumping straight to the top/bottom.
+const MAX_WHEEL_BURST_NOTCHES: isize = 4;
 
 /// Scroll the transcript by `delta` wrapped display lines (positive = up,
 /// towards older output). `frame_area` is the full frame; the transcript
 /// rect is derived from the live layout so the clamp matches exactly what
 /// `render_app_ui` draws. The offset saturates at the first line and snaps
-/// back to `0` (follow the newest output) at the bottom.
-pub fn scroll_transcript(state: &mut AppState, frame_area: Rect, delta: isize) {
+/// back to `0` (follow the newest output) at the bottom. Returns whether the
+/// effective scroll offset changed.
+pub fn scroll_transcript(state: &mut AppState, frame_area: Rect, delta: isize) -> bool {
     let [transcript, _] = compute_layout(frame_area, state);
     let max_up = CodexTranscriptWidget::new(
         &state.transcript,
@@ -78,11 +83,13 @@ pub fn scroll_transcript(state: &mut AppState, frame_area: Rect, delta: isize) {
     .with_session(&state.session)
     .max_scroll_up(transcript);
     let current = state.transcript_scroll.min(max_up);
-    state.transcript_scroll = if delta >= 0 {
+    let next = if delta >= 0 {
         current.saturating_add(delta as usize).min(max_up)
     } else {
         current.saturating_sub(delta.unsigned_abs())
     };
+    state.transcript_scroll = next;
+    next != current
 }
 
 /// Transcript scrollback keys: unmodified PageUp/PageDown page through chat
@@ -360,6 +367,9 @@ pub fn apply_internal_event(state: &mut AppState, event: AppInternalEvent) {
         AppInternalEvent::SendPromptFailed(message) => {
             state.on_send_failed(message);
         }
+        AppInternalEvent::SessionResumed(result) => {
+            resume::apply_result(state, result);
+        }
     }
 }
 
@@ -556,6 +566,31 @@ fn handle_mouse(
     }
 }
 
+fn handle_wheel(
+    state: &mut AppState,
+    client: &SidecarClient,
+    frame_area: Rect,
+    notches: isize,
+) {
+    if notches == 0 {
+        return;
+    }
+    let notches = notches.clamp(-MAX_WHEEL_BURST_NOTCHES, MAX_WHEEL_BURST_NOTCHES);
+    if state.overlay.is_open() {
+        let key = if notches > 0 {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        for _ in 0..notches.unsigned_abs() {
+            let _ = handle_key(state, client, key, KeyModifiers::empty());
+        }
+    } else {
+        let delta = notches.saturating_mul(WHEEL_SCROLL_LINES);
+        let _ = scroll_transcript(state, frame_area, delta);
+    }
+}
+
 /// Intercept a key while the slash-command suggestion popup is visible
 /// (SPEC-002). Returns `Some(outcome)` when the popup consumed the key;
 /// `None` lets the caller fall through to the composer.
@@ -650,8 +685,36 @@ fn handle_overlay_key(state: &mut AppState, client: &SidecarClient, code: KeyCod
         Overlay::ApprovalPicker(_) => handle_approval_picker_key(state, code),
         Overlay::Skills(_) => handle_skills_key(state, client, code),
         Overlay::Mcp(_) => handle_mcp_key(state, client, code),
+        Overlay::Resume(_) => handle_resume_key(state, client, code),
         _ => KeyOutcome::Handled,
     }
+}
+
+fn handle_resume_key(state: &mut AppState, client: &SidecarClient, code: KeyCode) -> KeyOutcome {
+    match code {
+        KeyCode::Esc => {
+            if let Overlay::Resume(overlay) = &state.overlay {
+                if !overlay.busy {
+                    state.overlay = Overlay::None;
+                }
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Overlay::Resume(overlay) = &mut state.overlay {
+                overlay.move_up();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Overlay::Resume(overlay) = &mut state.overlay {
+                overlay.move_down();
+            }
+        }
+        KeyCode::Enter => {
+            resume::commit(state, client);
+        }
+        _ => {}
+    }
+    KeyOutcome::Handled
 }
 
 fn handle_model_picker_key(state: &mut AppState, code: KeyCode) -> KeyOutcome {
@@ -970,6 +1033,14 @@ pub fn dispatch_slash(state: &mut AppState, client: &SidecarClient, cmd: SlashCo
             }
             KeyOutcome::Handled
         }
+        SlashCommand::Resume(arg) => {
+            if arg.trim().is_empty() {
+                resume::open(state);
+            } else {
+                resume::resume_direct(state, client, &arg);
+            }
+            KeyOutcome::Handled
+        }
         SlashCommand::Unknown(name) => {
             state.overlay = Overlay::Toast {
                 message: format!("unknown command: /{name}"),
@@ -977,14 +1048,6 @@ pub fn dispatch_slash(state: &mut AppState, client: &SidecarClient, cmd: SlashCo
             };
             KeyOutcome::Handled
         }
-        stub if stub.is_stub() => {
-            state.overlay = Overlay::Toast {
-                message: format!("{stub} — not yet implemented in this slice"),
-                created: Instant::now(),
-            };
-            KeyOutcome::Handled
-        }
-        _ => KeyOutcome::Handled,
     }
 }
 
@@ -1163,6 +1226,9 @@ async fn run_interactive_loop(
                     }
                     Some(TuiEvent::Term(CtEvent::Mouse(m))) => {
                         handle_mouse(state, client, terminal, m);
+                    }
+                    Some(TuiEvent::Wheel(notches)) => {
+                        handle_wheel(state, client, terminal.viewport_area, notches);
                     }
                     Some(TuiEvent::Term(CtEvent::Resize(_, _))) => {
                         // Cell coordinates shift on resize; drop any active
@@ -1385,16 +1451,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spec_002_remaining_stub_slash_shows_toast() {
-        // `/cost` and `/context` graduated from stubs to real overlays in
-        // Phase E; only `/resume` remains as a stub until the resume-flow
-        // UI is wired end-to-end. Update this test if that changes.
-        let mut state = AppState::new("/tmp".into());
+    async fn spec_003_resume_slash_opens_picker_or_toasts_empty() {
+        let mut state = AppState::new("/tmp/resume-cwd".into());
         let (client, _peer) = SidecarClient::in_memory();
-        let stub = SlashCommand::Resume(String::new());
-        dispatch_slash(&mut state, &client, stub);
-        assert!(state.overlay.is_toast(), "stub should show toast");
-        state.overlay = Overlay::None;
+        // No store → toast.
+        dispatch_slash(&mut state, &client, SlashCommand::Resume(String::new()));
+        assert!(state.overlay.is_toast());
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "cusa-resume-slash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::session_store::SessionStore::new(dir.join("sessions.json"));
+        store
+            .record_new(crate::session_store::StoredSession {
+                agent_id: "agent-slash-dddddddd".into(),
+                cwd: "/tmp/resume-cwd".into(),
+                model: "composer-2.5".into(),
+                approval_mode: ApprovalMode::Suggest,
+                enabled_skill_ids: vec![],
+                mcp_overrides: None,
+                created_at: 1,
+                last_used_at: 1,
+                turns: 1,
+            })
+            .unwrap();
+        state.session_store = Some(store);
+        dispatch_slash(&mut state, &client, SlashCommand::Resume(String::new()));
+        assert!(
+            matches!(state.overlay, Overlay::Resume(_)),
+            "expected Resume overlay"
+        );
     }
 
     #[tokio::test]
@@ -2200,16 +2293,32 @@ mod tests {
         let mut state = overflowing_state(100);
         let frame = Rect::new(0, 0, 80, 24);
         // Scrolling down while already at the tail stays pinned.
-        scroll_transcript(&mut state, frame, -10);
+        assert!(!scroll_transcript(&mut state, frame, -10));
         assert_eq!(state.transcript_scroll, 0);
         // A huge upward delta clamps at the first line.
-        scroll_transcript(&mut state, frame, isize::MAX);
+        assert!(scroll_transcript(&mut state, frame, isize::MAX));
         let max = state.transcript_scroll;
         assert!(max > 0, "fixture must overflow the transcript pane");
-        scroll_transcript(&mut state, frame, 5);
+        assert!(!scroll_transcript(&mut state, frame, 5));
         assert_eq!(state.transcript_scroll, max, "already at the top");
         // And scrolling back down eventually re-enters follow mode.
-        scroll_transcript(&mut state, frame, -(max as isize));
+        assert!(scroll_transcript(&mut state, frame, -(max as isize)));
+        assert_eq!(state.transcript_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn coalesced_wheel_delta_scrolls_once_by_net_notches() {
+        let mut state = overflowing_state(100);
+        let (client, _peer) = SidecarClient::in_memory();
+        let frame = Rect::new(0, 0, 80, 24);
+
+        handle_wheel(&mut state, &client, frame, 12);
+        assert_eq!(
+            state.transcript_scroll,
+            (MAX_WHEEL_BURST_NOTCHES * WHEEL_SCROLL_LINES) as usize
+        );
+
+        handle_wheel(&mut state, &client, frame, -7);
         assert_eq!(state.transcript_scroll, 0);
     }
 

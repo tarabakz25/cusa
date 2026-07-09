@@ -15,7 +15,9 @@
 // handling, slash-command dispatch, notification application — can enqueue
 // an event without threading extra arguments through.
 
-use cusa_rpc::{McpServerInfo, ModelInfo, SkillInfo};
+use crate::session_store::StoredSession;
+use cusa_rpc::{ApprovalMode, McpServerInfo, ModelInfo, SkillInfo};
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 /// A message the event loop should apply to `AppState`.
@@ -45,6 +47,8 @@ pub enum AppInternalEvent {
     /// error and unlock the composer itself — otherwise the spinner runs
     /// forever (issue #5). Carries the human-readable failure message.
     SendPromptFailed(String),
+    /// Mid-session `/resume` completed (dispose + `session/resume`).
+    SessionResumed(Result<SessionResumedPayload, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,18 @@ pub struct McpTogglePayload {
     pub server_id: String,
     pub enabled: bool,
     pub pending_until_next_turn: bool,
+}
+
+/// Successful mid-session `/resume` payload applied on the event-loop thread.
+#[derive(Debug, Clone)]
+pub struct SessionResumedPayload {
+    pub session_id: String,
+    pub agent_id: String,
+    pub model: String,
+    pub approval_mode: ApprovalMode,
+    pub enabled_skill_ids: Vec<String>,
+    pub mcp_overrides: Option<Value>,
+    pub stored: StoredSession,
 }
 
 /// Handle stashed on `AppState`. `clone`-able so async tasks can enqueue.
