@@ -112,6 +112,13 @@ async fn run(mut cli: Cli, log_path: Option<std::path::PathBuf>) -> Result<()> {
     )?;
     let mut cfg = sidecar::SupervisorConfig::new(locator, std::path::PathBuf::from(&cwd));
     cfg.log_path = log_path.clone();
+    // SPEC-102 (sidecar half): with `--verbose`, hand the sidecar its own
+    // rotating-log file next to the TUI log. Passed via `CUSA_LOG_FILE` at
+    // spawn time (see `supervisor::build_command`).
+    cfg.sidecar_log_path = log_path.as_ref().and_then(|p| {
+        p.parent()
+            .map(|dir| dir.join(format!("cusa-sidecar-{}.log", std::process::id())))
+    });
 
     let supervisor = sidecar::SidecarSupervisor::spawn(cfg).await?;
     let (client, events) = supervisor.into_parts();

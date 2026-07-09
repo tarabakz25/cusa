@@ -115,7 +115,7 @@ impl CusaViewModel {
 fn map_run_phase(phase: RunPhase) -> RunPhaseView {
     match phase {
         RunPhase::Idle => RunPhaseView::Idle,
-        RunPhase::Routing => RunPhaseView::Routing,
+        RunPhase::Sending => RunPhaseView::Sending,
         RunPhase::Streaming => RunPhaseView::Streaming,
         RunPhase::AwaitingApproval => RunPhaseView::AwaitingApproval,
         RunPhase::Cancelling => RunPhaseView::Cancelling,
@@ -123,7 +123,8 @@ fn map_run_phase(phase: RunPhase) -> RunPhaseView {
 }
 
 fn overlay_blocks_input(overlay: &Overlay) -> bool {
-    overlay.is_open()
+    // Toasts are transient notices; keep composer text visible while they show.
+    overlay.is_open() && !overlay.is_toast()
 }
 
 #[cfg(test)]
@@ -172,7 +173,7 @@ mod tests {
         assert!(view.active);
         assert!(!view.multiline);
         assert!(!view.history_nav_active);
-        assert_eq!(view.phase, RunPhaseView::Routing);
+        assert_eq!(view.phase, RunPhaseView::Sending);
     }
 
     #[test]
@@ -181,6 +182,20 @@ mod tests {
         state.overlay = Overlay::Help;
         let view = CusaViewModel::composer_view(&state);
         assert!(!view.active);
+    }
+
+    #[test]
+    fn spec_104_composer_view_active_during_toast() {
+        use std::time::Instant;
+        let mut state = AppState::new("/tmp".into());
+        state.input = "hello".into();
+        state.overlay = Overlay::Toast {
+            message: "copied \"x\"".into(),
+            created: Instant::now(),
+        };
+        let view = CusaViewModel::composer_view(&state);
+        assert!(view.active, "toast must not hide composer text");
+        assert_eq!(view.buffer, "hello");
     }
 
     #[test]

@@ -41,6 +41,10 @@ pub struct SupervisorConfig {
     pub ping_timeout: Duration,
     /// Optional log path (surfaced in fatal modal per SPEC-074).
     pub log_path: Option<PathBuf>,
+    /// Optional rotating-log file for the *sidecar* (SPEC-102, sidecar
+    /// half). When set, `spawn_child` exports it as `CUSA_LOG_FILE` so the
+    /// sidecar mirrors every `log` notification into that file.
+    pub sidecar_log_path: Option<PathBuf>,
 }
 
 impl SupervisorConfig {
@@ -51,6 +55,7 @@ impl SupervisorConfig {
             ping_interval: Duration::from_secs(5),
             ping_timeout: Duration::from_secs(10),
             log_path: None,
+            sidecar_log_path: None,
         }
     }
 }
@@ -262,13 +267,7 @@ async fn supervise(
 }
 
 async fn spawn_child(cfg: &SupervisorConfig) -> Result<Child> {
-    let mut cmd = Command::new(&cfg.locator.node);
-    cmd.arg(&cfg.locator.entry)
-        .current_dir(&cfg.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut cmd = build_command(cfg);
     cmd.spawn().with_context(|| {
         format!(
             "spawning sidecar: {} {}",
@@ -276,4 +275,63 @@ async fn spawn_child(cfg: &SupervisorConfig) -> Result<Child> {
             cfg.locator.entry.display()
         )
     })
+}
+
+/// Compose the sidecar `Command`. Split from `spawn_child` so the env /
+/// argv wiring is unit-testable without spawning a process.
+///
+/// SPEC-102 (sidecar half): the sidecar's rotating file logger is armed by
+/// the `CUSA_LOG_FILE` env var at spawn time. Before this was wired up the
+/// sidecar log file was silently never written (issue #5, item 3).
+fn build_command(cfg: &SupervisorConfig) -> Command {
+    let mut cmd = Command::new(&cfg.locator.node);
+    cmd.arg(&cfg.locator.entry)
+        .current_dir(&cfg.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(path) = &cfg.sidecar_log_path {
+        cmd.env("CUSA_LOG_FILE", path);
+    }
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cfg() -> SupervisorConfig {
+        let locator = SidecarLocator {
+            node: PathBuf::from("/usr/bin/node"),
+            entry: PathBuf::from("/opt/cusa/sidecar/dist/index.js"),
+        };
+        SupervisorConfig::new(locator, PathBuf::from("/tmp/repo"))
+    }
+
+    #[test]
+    fn spec_102_build_command_exports_cusa_log_file_when_configured() {
+        let mut cfg = test_cfg();
+        cfg.sidecar_log_path = Some(PathBuf::from("/tmp/logs/cusa-sidecar-42.log"));
+        let cmd = build_command(&cfg);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            envs.iter().any(|(k, v)| {
+                *k == std::ffi::OsStr::new("CUSA_LOG_FILE")
+                    && v.is_some_and(|v| v == std::ffi::OsStr::new("/tmp/logs/cusa-sidecar-42.log"))
+            }),
+            "CUSA_LOG_FILE should be exported to the sidecar: {envs:?}"
+        );
+    }
+
+    #[test]
+    fn spec_102_build_command_omits_cusa_log_file_by_default() {
+        let cfg = test_cfg();
+        let cmd = build_command(&cfg);
+        let has_env = cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, _)| k == std::ffi::OsStr::new("CUSA_LOG_FILE"));
+        assert!(!has_env, "CUSA_LOG_FILE must not be set when logging is off");
+    }
 }

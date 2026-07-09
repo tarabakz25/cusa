@@ -12,6 +12,7 @@ pub mod login;
 pub mod mcp;
 pub mod model_picker;
 pub mod overlay;
+pub mod selection;
 pub mod skills;
 pub mod slash;
 pub mod startup;
@@ -24,8 +25,8 @@ use crate::app::events::{spawn_input, TuiEvent};
 use crate::codex_adapter::{BottomPaneWidget, ComposerKeyResult, handle_composer_key};
 use crate::app::internal::{channel as internal_channel, AppInternalEvent, AppInternalRx};
 use crate::app::overlay::{
-    cycle_approval_mode, ApprovalPickerOverlay, McpOverlay, ModelPickerOverlay, Overlay,
-    OverlayWidget, SkillsOverlay,
+    cycle_approval_mode, ApprovalPickerOverlay, McpOverlay, ModelPickerFocus,
+    ModelPickerOverlay, Overlay, OverlayWidget, SkillsOverlay,
 };
 use crate::app::slash::SlashCommand;
 use crate::app::state::{AppState, CtrlCOutcome, RunPhase, SidecarStatusView};
@@ -35,7 +36,7 @@ use crate::sidecar::events::{SidecarEvent, SidecarStatus};
 use crate::sidecar::SidecarClient;
 use anyhow::Result;
 use crossterm::event::{Event as CtEvent, KeyCode, KeyModifiers};
-use cusa_rpc::{ApprovalMode, RunFinishedParams, ServerNotification};
+use cusa_rpc::{ApprovalMode, ModelSelection, RunFinishedParams, ServerNotification};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::widgets::Widget;
@@ -63,6 +64,7 @@ trait RenderFrame {
     fn area(&self) -> Rect;
     fn render_widget<W: Widget>(&mut self, widget: W, area: Rect);
     fn place_composer_cursor(&mut self, pos: Option<(u16, u16)>);
+    fn frame_buffer_mut(&mut self) -> &mut ratatui::buffer::Buffer;
 }
 
 impl RenderFrame for ratatui::Frame<'_> {
@@ -75,6 +77,10 @@ impl RenderFrame for ratatui::Frame<'_> {
     }
 
     fn place_composer_cursor(&mut self, _pos: Option<(u16, u16)>) {}
+
+    fn frame_buffer_mut(&mut self) -> &mut ratatui::buffer::Buffer {
+        self.buffer_mut()
+    }
 }
 
 impl RenderFrame for crate::codex_ui::custom_terminal::Frame<'_> {
@@ -90,6 +96,10 @@ impl RenderFrame for crate::codex_ui::custom_terminal::Frame<'_> {
         if let Some((x, y)) = pos {
             self.set_cursor_position((x, y));
         }
+    }
+
+    fn frame_buffer_mut(&mut self) -> &mut ratatui::buffer::Buffer {
+        self.buffer_mut()
     }
 }
 
@@ -114,6 +124,11 @@ fn render_app_ui<F: RenderFrame>(state: &AppState, frame: &mut F) {
             frame.area(),
         );
         frame.place_composer_cursor(cursor);
+    }
+    // Copy-on-select (PR #9): overlay the drag selection on top of
+    // everything so the highlight tracks exactly what will be copied.
+    if let Some(sel) = &state.selection {
+        selection::highlight(frame.frame_buffer_mut(), sel);
     }
 }
 
@@ -285,6 +300,9 @@ pub fn apply_internal_event(state: &mut AppState, event: AppInternalEvent) {
         AppInternalEvent::ContextSetStrategy(result) => {
             context::apply_result(state, result);
         }
+        AppInternalEvent::SendPromptFailed(message) => {
+            state.on_send_failed(message);
+        }
     }
 }
 
@@ -354,6 +372,9 @@ pub fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> KeyOutcome {
+    // Any key press dismisses an active mouse selection (tmux-like):
+    // the content under the highlight is about to change.
+    state.selection = None;
     // Ctrl-C first, regardless of overlay.
     if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
         let outcome = state.on_ctrl_c(Instant::now());
@@ -421,6 +442,51 @@ pub fn handle_key(
     match result {
         ComposerKeyResult::Submit => submit_input(state, client),
         ComposerKeyResult::Handled => KeyOutcome::Handled,
+    }
+}
+
+/// Handle a mouse event in the interactive loop: tmux-style copy-on-select
+/// (PR #9). Dragging updates the highlight (the loop redraws after every
+/// event); releasing the button extracts the selected text from the last
+/// rendered frame and copies it — no explicit copy keystroke required.
+fn handle_mouse(
+    state: &mut AppState,
+    client: &SidecarClient,
+    terminal: &mut crate::terminal::InteractiveTerminal,
+    ev: crossterm::event::MouseEvent,
+) {
+    use crate::app::selection::MouseAction;
+    let area = terminal.viewport_area;
+    match selection::on_mouse_event(&mut state.selection, area, &ev) {
+        MouseAction::None | MouseAction::Redraw => {}
+        MouseAction::Copy(sel) => {
+            let text = selection::extract_text(terminal.last_frame_buffer(), &sel);
+            if text.trim().is_empty() {
+                return;
+            }
+            // Primary path: OSC 52 straight to the terminal. Works in
+            // iTerm2 / kitty / WezTerm / Alacritty / Windows Terminal and
+            // is forwarded across SSH and tmux (`set-clipboard`).
+            let osc = selection::osc52_sequence(&text);
+            let backend = terminal.backend_mut();
+            let _ = std::io::Write::write_all(backend, osc.as_bytes());
+            let _ = std::io::Write::flush(backend);
+            // Fallback: platform clipboard helper on a detached thread
+            // (covers terminals without OSC 52, e.g. macOS Terminal.app).
+            selection::spawn_system_clipboard_copy(text.clone());
+            state.overlay = Overlay::Toast {
+                message: selection::copied_toast_message(&text),
+                created: Instant::now(),
+            };
+        }
+        // Preserve the pre-capture "alternate scroll" behavior where the
+        // wheel produced arrow-key sequences in the alternate screen.
+        MouseAction::ScrollUp => {
+            let _ = handle_key(state, client, KeyCode::Up, KeyModifiers::empty());
+        }
+        MouseAction::ScrollDown => {
+            let _ = handle_key(state, client, KeyCode::Down, KeyModifiers::empty());
+        }
     }
 }
 
@@ -537,19 +603,40 @@ fn handle_model_picker_key(state: &mut AppState, code: KeyCode) -> KeyOutcome {
                 overlay.move_down();
             }
         }
-        KeyCode::Enter => {
-            let selected_id = {
-                if let Overlay::ModelPicker(overlay) = &state.overlay {
-                    overlay.selected().map(|m| m.id.clone())
+        KeyCode::Left => {
+            if let Overlay::ModelPicker(overlay) = &mut state.overlay {
+                if overlay.focus == ModelPickerFocus::Parameters {
+                    overlay.cycle_param_value(-1);
                 } else {
-                    None
+                    overlay.focus_models();
                 }
+            }
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            if let Overlay::ModelPicker(overlay) = &mut state.overlay {
+                if overlay.focus == ModelPickerFocus::Parameters {
+                    overlay.cycle_param_value(1);
+                } else {
+                    overlay.focus_parameters();
+                }
+            }
+        }
+        KeyCode::BackTab => {
+            if let Overlay::ModelPicker(overlay) = &mut state.overlay {
+                overlay.focus_models();
+            }
+        }
+        KeyCode::Enter => {
+            let selection = if let Overlay::ModelPicker(overlay) = &state.overlay {
+                overlay.build_selection()
+            } else {
+                None
             };
-            if let Some(id) = selected_id {
-                if id == "auto" {
+            if let Some(sel) = selection {
+                if sel.id == "auto" {
                     clear_model_override(state);
                 } else {
-                    set_model_override(state, id);
+                    set_model_override(state, sel);
                 }
                 state.overlay = Overlay::None;
             }
@@ -681,18 +768,26 @@ fn submit_input(state: &mut AppState, client: &SidecarClient) -> KeyOutcome {
         return KeyOutcome::Handled;
     }
     let override_ = state.session.manual_model_override.clone();
+    let internal_tx = state.internal_tx.clone();
     state.begin_user_turn(text.clone());
-    spawn_send_prompt(client.clone(), session_id, text, override_);
+    spawn_send_prompt(client.clone(), session_id, text, override_, internal_tx);
     KeyOutcome::Handled
 }
 
 /// Fire a `session/send` request in a detached task (SPEC-016 injects the
 /// optional model override).
+///
+/// The RPC outcome is NOT discarded (issue #5): if the sidecar returns an
+/// error response (e.g. `NO_API_KEY`, `session/send failed`) or the call
+/// times out / loses transport, no `run/error` will ever arrive — the run
+/// was never established — so a `SendPromptFailed` internal event is pushed
+/// to surface the error in the transcript and return the phase to `Idle`.
 pub fn spawn_send_prompt(
     client: SidecarClient,
     session_id: String,
     text: String,
-    model_override: Option<String>,
+    model_override: Option<ModelSelection>,
+    internal_tx: Option<crate::app::internal::AppInternalTx>,
 ) {
     if tokio::runtime::Handle::try_current().is_err() {
         return;
@@ -700,15 +795,26 @@ pub fn spawn_send_prompt(
     tokio::spawn(async move {
         let mut params = serde_json::json!({ "sessionId": session_id, "text": text });
         if let Some(m) = model_override {
-            params["modelOverride"] = serde_json::Value::String(m);
+            if let Ok(v) = serde_json::to_value(m) {
+                params["modelOverride"] = v;
+            }
         }
-        let _ = client
+        let outcome = client
             .call(
                 cusa_rpc::method::SESSION_SEND,
                 Some(params),
                 std::time::Duration::from_secs(600),
             )
             .await;
+        let failure = match outcome {
+            Ok(response) => response
+                .error
+                .map(|e| format!("session/send failed (rpc error {}): {}", e.code, e.message)),
+            Err(err) => Some(format!("session/send failed: {err:#}")),
+        };
+        if let (Some(tx), Some(message)) = (internal_tx, failure) {
+            let _ = tx.send(AppInternalEvent::SendPromptFailed(message));
+        }
     });
 }
 
@@ -829,7 +935,7 @@ fn dispatch_model(
             clear_model_override(state);
         }
         Some(id) => {
-            set_model_override(state, id.to_string());
+            set_model_override(state, ModelSelection::id_only(id.to_string()));
         }
     }
     KeyOutcome::Handled
@@ -871,11 +977,12 @@ fn dispatch_approval(state: &mut AppState, arg: Option<String>) -> KeyOutcome {
     KeyOutcome::Handled
 }
 
-fn set_model_override(state: &mut AppState, id: String) {
-    state.session.manual_model_override = Some(id.clone());
-    state.session.model = id.clone();
+fn set_model_override(state: &mut AppState, selection: ModelSelection) {
+    let label = model_picker::format_model_label(&selection, state.models_cache.as_deref());
+    state.session.manual_model_override = Some(selection);
+    state.session.model = label.clone();
     state.overlay = Overlay::Toast {
-        message: format!("model override: {id}"),
+        message: format!("model override: {label}"),
         created: Instant::now(),
     };
 }
@@ -984,7 +1091,13 @@ async fn run_interactive_loop(
                             break;
                         }
                     }
+                    Some(TuiEvent::Term(CtEvent::Mouse(m))) => {
+                        handle_mouse(state, client, terminal, m);
+                    }
                     Some(TuiEvent::Term(CtEvent::Resize(_, _))) => {
+                        // Cell coordinates shift on resize; drop any active
+                        // selection instead of copying the wrong region.
+                        state.selection = None;
                         let _ = crate::terminal::TerminalSession::sync_viewport(terminal);
                     }
                     Some(_) => {}
@@ -1170,7 +1283,7 @@ mod tests {
     async fn spec_002_reset_slash_disposes_session_and_records_note() {
         let mut state = AppState::new("/tmp".into());
         state.session.session_id = Some("gone".into());
-        state.session.manual_model_override = Some("claude-sonnet-4".into());
+        state.session.manual_model_override = Some(ModelSelection::id_only("claude-sonnet-4"));
         state.always_approved_tools.insert("shell".into());
         let (client, mut peer) = SidecarClient::in_memory();
         dispatch_slash(&mut state, &client, SlashCommand::Reset);
@@ -1331,7 +1444,7 @@ mod tests {
             SlashCommand::Model(Some("claude-sonnet-4".into())),
         );
         assert_eq!(
-            state.session.manual_model_override.as_deref(),
+            state.session.manual_model_override.as_ref().map(|m| m.id.as_str()),
             Some("claude-sonnet-4")
         );
         state.overlay = Overlay::None;
@@ -1346,7 +1459,7 @@ mod tests {
         let frame = peer.try_recv_outbound().expect("session/send fired");
         if let crate::sidecar::OutboundFrame::Value(v) = frame {
             assert_eq!(v["method"], "session/send");
-            assert_eq!(v["params"]["modelOverride"], "claude-sonnet-4");
+            assert_eq!(v["params"]["modelOverride"]["id"], "claude-sonnet-4");
             assert_eq!(v["params"]["text"], "hello");
         } else {
             panic!("unexpected frame type");
@@ -1356,7 +1469,7 @@ mod tests {
     #[tokio::test]
     async fn spec_016_slash_model_auto_clears_override() {
         let mut state = AppState::new("/tmp".into());
-        state.session.manual_model_override = Some("claude-sonnet-4".into());
+        state.session.manual_model_override = Some(ModelSelection::id_only("claude-sonnet-4"));
         let (client, _peer) = SidecarClient::in_memory();
         dispatch_slash(
             &mut state,
@@ -1382,6 +1495,7 @@ mod tests {
                 display_name: None,
                 provider: None,
                 supports_thinking: false,
+                parameters: vec![],
             }])),
         );
         if let Overlay::ModelPicker(overlay) = &state.overlay {
@@ -1841,5 +1955,143 @@ mod tests {
         handle_key(&mut popup, &client, KeyCode::Tab, KeyModifiers::empty());
         assert_eq!(popup.session.approval_mode, before, "popup Tab must not cycle");
         assert_eq!(popup.input, "/help", "popup Tab completes the selection");
+    }
+
+    // ----- issue #5: session/send failure handling ------------------------
+
+    /// End-to-end: a `session/send` RPC error response must produce a
+    /// `SendPromptFailed` internal event that, once applied, surfaces the
+    /// error and returns the phase to Idle instead of spinning forever.
+    #[tokio::test]
+    async fn issue_5_send_rpc_error_unlocks_ui_via_internal_event() {
+        let mut state = AppState::new("/tmp".into());
+        let (tx, mut rx) = internal_channel();
+        state.internal_tx = Some(tx.clone());
+        state.begin_user_turn("hello".into());
+        assert_eq!(state.phase, RunPhase::Sending);
+
+        let (client, mut peer) = SidecarClient::in_memory();
+        spawn_send_prompt(client, "s0".into(), "hello".into(), None, Some(tx));
+
+        // The sidecar side replies with an RPC error (e.g. NO_API_KEY).
+        let frame = peer.expect_frame().await;
+        let crate::sidecar::OutboundFrame::Value(v) = frame else {
+            panic!("expected a request frame");
+        };
+        assert_eq!(v["method"], "session/send");
+        let id: i64 = v["id"].as_i64().expect("request id");
+        peer.respond_err(
+            cusa_rpc::RequestId::Num(id),
+            -32001,
+            "CURSOR_API_KEY is not set. Run `cusa login` or export CURSOR_API_KEY.",
+        );
+
+        let event = rx.recv().await.expect("internal event must be emitted");
+        let AppInternalEvent::SendPromptFailed(ref msg) = event else {
+            panic!("expected SendPromptFailed, got {event:?}");
+        };
+        assert!(msg.contains("CURSOR_API_KEY"), "message carries the cause: {msg}");
+
+        apply_internal_event(&mut state, event);
+        assert_eq!(state.phase, RunPhase::Idle, "spinner must stop");
+        assert!(state.current_turn.is_none());
+        assert!(state
+            .transcript
+            .iter()
+            .any(|e| matches!(e, TranscriptEntry::Error(m) if m.contains("CURSOR_API_KEY"))));
+    }
+
+    /// A successful `session/send` response must NOT emit `SendPromptFailed`.
+    #[tokio::test]
+    async fn issue_5_send_rpc_success_emits_no_failure_event() {
+        let (tx, mut rx) = internal_channel();
+        let (client, mut peer) = SidecarClient::in_memory();
+        spawn_send_prompt(client, "s0".into(), "hi".into(), None, Some(tx));
+
+        let frame = peer.expect_frame().await;
+        let crate::sidecar::OutboundFrame::Value(v) = frame else {
+            panic!("expected a request frame");
+        };
+        let id: i64 = v["id"].as_i64().expect("request id");
+        peer.respond_ok(
+            cusa_rpc::RequestId::Num(id),
+            serde_json::json!({ "runId": "run-1" }),
+        );
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no internal event should fire on success"
+        );
+    }
+
+    // ---- copy-on-select (PR #9) ----
+
+    #[test]
+    fn active_selection_renders_reversed_highlight_over_the_frame() {
+        let mut state = AppState::new("/tmp".into());
+        state.selection = Some(crate::app::selection::Selection {
+            anchor: (2, 1),
+            head: (6, 1),
+            dragged: true,
+        });
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw_to_buffer(&state, &mut terminal).unwrap();
+        let buf = terminal.backend().buffer();
+        let reversed = |x: u16, y: u16| {
+            buf.cell((x, y))
+                .expect("cell")
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        };
+        for x in 2..=6 {
+            assert!(reversed(x, 1), "cell ({x},1) must be highlighted");
+        }
+        assert!(!reversed(1, 1), "cell before anchor must not be highlighted");
+        assert!(!reversed(7, 1), "cell after head must not be highlighted");
+        assert!(!reversed(4, 3), "other rows must not be highlighted");
+    }
+
+    #[test]
+    fn selection_extracts_the_text_the_user_sees() {
+        let mut state = AppState::new("/tmp".into());
+        state.transcript.push(TranscriptEntry::User("hello copy".into()));
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw_to_buffer(&state, &mut terminal).unwrap();
+
+        // Locate the rendered message, then select exactly that region.
+        let buf = terminal.backend().buffer();
+        let mut found: Option<(u16, u16)> = None;
+        'outer: for y in 0..20u16 {
+            for x in 0..80u16 {
+                let mut s = String::new();
+                for dx in 0.."hello copy".len() as u16 {
+                    s.push_str(buf.cell((x + dx, y)).map(|c| c.symbol()).unwrap_or(""));
+                }
+                if s == "hello copy" {
+                    found = Some((x, y));
+                    break 'outer;
+                }
+            }
+        }
+        let (x, y) = found.expect("rendered transcript must contain the user message");
+        let sel = crate::app::selection::Selection {
+            anchor: (x, y),
+            head: (x + "hello copy".len() as u16 - 1, y),
+            dragged: true,
+        };
+        assert_eq!("hello copy", crate::app::selection::extract_text(buf, &sel));
+    }
+
+    #[tokio::test]
+    async fn any_key_press_clears_an_active_selection() {
+        let mut state = AppState::new("/tmp".into());
+        let (client, _peer) = SidecarClient::in_memory();
+        state.selection = Some(crate::app::selection::Selection::new(1, 1));
+        handle_key(&mut state, &client, KeyCode::Char('a'), KeyModifiers::empty());
+        assert_eq!(None, state.selection, "typing must dismiss the highlight");
     }
 }

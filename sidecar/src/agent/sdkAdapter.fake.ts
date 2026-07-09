@@ -15,7 +15,7 @@ import type {
   TurnHandle,
   TurnResult,
 } from "./sdkAdapter.js";
-import type { ModelInfo } from "../rpc/schema.js";
+import type { ModelInfo, ModelSelection } from "../rpc/schema.js";
 
 export type TurnScript = {
   events: TurnEvent[];
@@ -52,16 +52,40 @@ export interface FakeAdapterState {
   sendCalls: Array<{
     agentId: string;
     text: string;
-    modelOverride?: string;
+    modelOverride?: ModelSelection;
     systemContext?: string;
     mcpServers?: Record<string, unknown>;
   }>;
+  /** Arguments of every `cancelStaleRuns` call, in call order. */
+  cancelStaleRunsCalls: Array<{ agentId: string; cwd: string }>;
 }
 
 export class FakeSdkAdapter implements SdkAdapter {
   readonly state: FakeAdapterState = {
     models: [
-      { id: "composer-2.5", displayName: "Composer 2.5" },
+      {
+        id: "composer-2.5",
+        displayName: "Composer 2.5",
+        parameters: [
+          {
+            id: "effort",
+            displayName: "Effort",
+            values: [
+              { value: "low", displayName: "Low" },
+              { value: "medium", displayName: "Medium" },
+              { value: "high", displayName: "High" },
+            ],
+          },
+          {
+            id: "fast",
+            displayName: "Fast",
+            values: [
+              { value: "false", displayName: "Off" },
+              { value: "true", displayName: "On" },
+            ],
+          },
+        ],
+      },
       { id: "claude-sonnet-4", displayName: "Claude Sonnet 4" },
     ],
     listModelsKeys: [],
@@ -71,6 +95,7 @@ export class FakeSdkAdapter implements SdkAdapter {
     resumeCalls: [],
     disposedAgentIds: [],
     sendCalls: [],
+    cancelStaleRunsCalls: [],
   };
 
   /**
@@ -79,8 +104,40 @@ export class FakeSdkAdapter implements SdkAdapter {
    */
   scripts: TurnScript[] = [];
 
+  /**
+   * When true, the next `send()` call never resolves on its own — it only
+   * settles (with a rejection) once the caller aborts `SendOptions.signal`.
+   * Used to exercise the session-level send timeout (issue #5).
+   */
+  hangNextSend = false;
+
+  /**
+   * When > 0, the next N `send()` calls reject with the SDK's local-store
+   * busy error ("Agent <id> already has active run") before any turn is
+   * created — mirroring @cursor/sdk, whose store guard runs before the
+   * network phase. Decremented per rejected send.
+   */
+  busyNextSends = 0;
+
+  /** Value `cancelStaleRuns` reports as the number of cancelled runs. */
+  staleRunsToCancel = 1;
+
+  /** When true, `cancelStaleRuns` rejects (simulates a broken store). */
+  failCancelStaleRuns = false;
+
   script(...s: TurnScript[]): void {
     this.scripts.push(...s);
+  }
+
+  async cancelStaleRuns(
+    agentId: string,
+    opts: { cwd: string },
+  ): Promise<number> {
+    this.state.cancelStaleRunsCalls.push({ agentId, cwd: opts.cwd });
+    if (this.failCancelStaleRuns) {
+      throw new Error("fake local agent store unavailable");
+    }
+    return this.staleRunsToCancel;
   }
 
   async listModels(apiKey: string): Promise<ModelInfo[]> {
@@ -107,11 +164,11 @@ class FakeAgentHandle implements AgentHandle {
   constructor(
     private readonly adapter: FakeSdkAdapter,
     public readonly agentId: string,
-    private _model: string | undefined,
+    private _model: ModelSelection | undefined,
   ) {}
 
   get model(): string | undefined {
-    return this._model;
+    return this._model?.id;
   }
 
   async send(text: string, opts: SendOptions): Promise<TurnHandle> {
@@ -128,12 +185,28 @@ class FakeAgentHandle implements AgentHandle {
         ? {}
         : { mcpServers: opts.mcpServers }),
     });
+    if (this.adapter.busyNextSends > 0) {
+      this.adapter.busyNextSends -= 1;
+      throw new Error(`Agent ${this.agentId} already has active run`);
+    }
+    if (this.adapter.hangNextSend) {
+      this.adapter.hangNextSend = false;
+      return new Promise<TurnHandle>((_, reject) => {
+        const abort = () =>
+          reject(new Error("fake send aborted via SendOptions.signal"));
+        if (opts.signal?.aborted) {
+          abort();
+          return;
+        }
+        opts.signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
     const script = this.adapter.scripts.shift() ?? {
       events: [],
       result: { status: "finished" },
     };
     const runId = `fake-run-${this.adapter.state.nextRunId++}`;
-    const effectiveModel = opts.modelOverride ?? this._model;
+    const effectiveModel = opts.modelOverride?.id ?? this._model?.id;
     if (opts.modelOverride) {
       this._model = opts.modelOverride;
     }

@@ -295,6 +295,9 @@ function lazyAdapter(factory: () => Promise<SdkAdapter>): SdkAdapter {
     async listModels(apiKey) {
       return (await get()).listModels(apiKey);
     },
+    async cancelStaleRuns(agentId, opts) {
+      return (await get()).cancelStaleRuns(agentId, opts);
+    },
     async createAgent(opts) {
       return (await get()).createAgent(opts);
     },
@@ -336,6 +339,13 @@ async function defaultSdkVersion(): Promise<string> {
 }
 
 export async function main(): Promise<void> {
+  // `@cursor/sdk` (and its nested local-runtime logger) occasionally writes
+  // human INFO lines to process.stdout. That fd is our JSON-RPC channel to
+  // the TUI — a single non-JSON line used to kill the TUI reader and hang
+  // the run under back-pressure. Divert anything that isn't a JSON object
+  // frame to stderr so the RPC pipe stays clean.
+  guardStdoutForRpc();
+
   // Router config must load before buildServer so the SessionManager is
   // constructed with the disk-backed, hot-reloading Router (issue #7).
   const routerLogs: Array<["info" | "warn" | "error", string]> = [];
@@ -373,6 +383,59 @@ export async function main(): Promise<void> {
   });
   process.stderr.write(`cusa-sidecar ${SIDECAR_VERSION} ready\n`);
   await server.run();
+}
+
+/**
+ * Keep `process.stdout` reserved for newline-delimited JSON-RPC frames.
+ * Anything that does not look like a JSON object is rewritten to stderr.
+ */
+export function guardStdoutForRpc(): void {
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = ((
+    chunk: string | Uint8Array,
+    encoding?: BufferEncoding | ((err?: Error | null) => void),
+    cb?: (err?: Error | null) => void,
+  ): boolean => {
+    const text =
+      typeof chunk === "string"
+        ? chunk
+        : Buffer.from(chunk).toString(
+            typeof encoding === "string" ? encoding : "utf8",
+          );
+    const trimmed = text.trimStart();
+    if (
+      trimmed.length === 0 ||
+      trimmed.startsWith("{") ||
+      trimmed.startsWith("[")
+    ) {
+      if (typeof encoding === "function") {
+        return origWrite(chunk, encoding);
+      }
+      return origWrite(chunk, encoding as BufferEncoding | undefined, cb);
+    }
+    if (typeof encoding === "function") {
+      return process.stderr.write(chunk, encoding);
+    }
+    return process.stderr.write(chunk, encoding as BufferEncoding | undefined, cb);
+  }) as typeof process.stdout.write;
+
+  // Also bounce console.* away from stdout (Node's default for log/info/debug).
+  for (const method of ["log", "info", "debug", "warn", "error"] as const) {
+    console[method] = (...args: unknown[]) => {
+      process.stderr.write(
+        args
+          .map((a) => {
+            if (typeof a === "string") return a;
+            try {
+              return JSON.stringify(a);
+            } catch {
+              return String(a);
+            }
+          })
+          .join(" ") + "\n",
+      );
+    };
+  }
 }
 
 async function runAsEntrypoint(): Promise<boolean> {

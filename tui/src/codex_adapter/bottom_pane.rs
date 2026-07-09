@@ -74,7 +74,7 @@ impl BottomPaneWidget {
 fn activity_line(state: &AppState) -> Option<Line<'static>> {
     let label = match state.phase {
         RunPhase::Idle => return None,
-        RunPhase::Routing => "Routing",
+        RunPhase::Sending => "Sending",
         RunPhase::Streaming => "Working",
         RunPhase::AwaitingApproval => "Waiting for approval",
         RunPhase::Cancelling => "Cancelling",
@@ -359,8 +359,8 @@ mod tests {
     #[test]
     fn spec_001_phase_labels_cover_all_active_states() {
         let mut state = streaming_state();
-        state.phase = RunPhase::Routing;
-        assert!(render_to_string(&state, 100, 10).contains("Routing"));
+        state.phase = RunPhase::Sending;
+        assert!(render_to_string(&state, 100, 10).contains("Sending"));
         state.phase = RunPhase::AwaitingApproval;
         assert!(render_to_string(&state, 100, 10).contains("Waiting for approval"));
         state.phase = RunPhase::Cancelling;

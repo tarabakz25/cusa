@@ -39,6 +39,12 @@ pub enum AppInternalEvent {
     /// as transcript entries unless the method is unknown (sidecar half
     /// not yet landed).
     ContextSetStrategy(Result<(), String>),
+    /// The `session/send` RPC failed (error response, transport loss, or
+    /// client-side timeout). The sidecar only emits `run/error` once a run
+    /// is established, so for send-level failures the TUI must surface the
+    /// error and unlock the composer itself — otherwise the spinner runs
+    /// forever (issue #5). Carries the human-readable failure message.
+    SendPromptFailed(String),
 }
 
 #[derive(Debug, Clone)]

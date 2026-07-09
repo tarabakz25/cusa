@@ -148,11 +148,34 @@ export interface ModelsListResult {
   models: ModelInfo[];
 }
 
+export interface ModelParameterValue {
+  id: string;
+  value: string;
+}
+
+/** Cursor SDK `ModelSelection` — model id plus optional params (effort, fast, …). */
+export interface ModelSelection {
+  id: string;
+  params?: ModelParameterValue[];
+}
+
+export interface ModelParameterValueOption {
+  value: string;
+  displayName?: string;
+}
+
+export interface ModelParameterDefinition {
+  id: string;
+  displayName?: string;
+  values: ModelParameterValueOption[];
+}
+
 export interface ModelInfo {
   id: string;
   displayName?: string;
   provider?: string;
   supportsThinking?: boolean;
+  parameters?: ModelParameterDefinition[];
 }
 
 export interface SessionCreateParams {
@@ -173,7 +196,7 @@ export interface SessionCreateResult {
 export interface SessionSendParams {
   sessionId: string;
   text: string;
-  modelOverride?: string;
+  modelOverride?: ModelSelection;
 }
 
 export interface SessionSendResult {

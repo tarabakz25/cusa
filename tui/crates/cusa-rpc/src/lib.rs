@@ -223,6 +223,52 @@ pub struct ModelsListResult {
     pub models: Vec<ModelInfo>,
 }
 
+/// A single model parameter value (Cursor SDK `ModelParameterValue`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelParameterValue {
+    pub id: String,
+    pub value: String,
+}
+
+/// Cursor SDK `ModelSelection` — model id plus optional per-model params
+/// (e.g. reasoning effort, fast mode).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSelection {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<ModelParameterValue>,
+}
+
+impl ModelSelection {
+    pub fn id_only(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            params: Vec::new(),
+        }
+    }
+}
+
+/// One allowed value for a model parameter (from `models/list`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelParameterValueOption {
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Parameter metadata returned by `models/list` (effort, fast, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelParameterDefinition {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub values: Vec<ModelParameterValueOption>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
@@ -233,6 +279,8 @@ pub struct ModelInfo {
     pub provider: Option<String>,
     #[serde(default)]
     pub supports_thinking: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<ModelParameterDefinition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,7 +313,7 @@ pub struct SessionSendParams {
     pub session_id: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_override: Option<String>,
+    pub model_override: Option<ModelSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1049,11 +1097,18 @@ mod tests {
         let p = SessionSendParams {
             session_id: "s1".into(),
             text: "hello".into(),
-            model_override: Some("claude-sonnet-4".into()),
+            model_override: Some(ModelSelection {
+                id: "claude-sonnet-4".into(),
+                params: vec![ModelParameterValue {
+                    id: "effort".into(),
+                    value: "high".into(),
+                }],
+            }),
         };
         let v = rt_json(&p);
         assert_eq!(v["sessionId"], "s1");
-        assert_eq!(v["modelOverride"], "claude-sonnet-4");
+        assert_eq!(v["modelOverride"]["id"], "claude-sonnet-4");
+        assert_eq!(v["modelOverride"]["params"][0]["id"], "effort");
     }
 
     #[test]

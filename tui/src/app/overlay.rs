@@ -19,7 +19,10 @@
 
 use crate::app::state::ContextStrategy;
 use crate::app::usage::UsageSnapshot;
-use cusa_rpc::{ApprovalMode, McpServerInfo, McpServerStatus, ModelInfo, SkillInfo, ToolCategory};
+use cusa_rpc::{
+    ApprovalMode, McpServerInfo, McpServerStatus, ModelInfo, ModelParameterDefinition,
+    ModelParameterValue, ModelSelection, SkillInfo, ToolCategory,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -155,6 +158,14 @@ impl McpOverlay {
     }
 }
 
+/// Which pane has keyboard focus in the model picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelPickerFocus {
+    #[default]
+    Models,
+    Parameters,
+}
+
 /// Model picker overlay state (SPEC-016).
 #[derive(Debug, Clone)]
 pub struct ModelPickerOverlay {
@@ -162,6 +173,10 @@ pub struct ModelPickerOverlay {
     pub models: Vec<ModelInfo>,
     pub cursor: usize,
     pub error: Option<String>,
+    pub focus: ModelPickerFocus,
+    pub param_cursor: usize,
+    /// Selected value per parameter id for the highlighted model.
+    pub param_values: Vec<(String, String)>,
 }
 
 impl ModelPickerOverlay {
@@ -171,32 +186,168 @@ impl ModelPickerOverlay {
             models: Vec::new(),
             cursor: 0,
             error: None,
+            focus: ModelPickerFocus::Models,
+            param_cursor: 0,
+            param_values: Vec::new(),
         }
     }
 
     pub fn populated(models: Vec<ModelInfo>) -> Self {
-        Self {
+        let mut overlay = Self {
             loading: false,
             models,
             cursor: 0,
             error: None,
+            focus: ModelPickerFocus::Models,
+            param_cursor: 0,
+            param_values: Vec::new(),
+        };
+        overlay.sync_params_for_cursor();
+        overlay
+    }
+
+    pub fn restore_selection(&mut self, selection: &ModelSelection) {
+        if let Some(i) = self.models.iter().position(|m| m.id == selection.id) {
+            self.cursor = i;
+            self.sync_params_for_cursor();
+            for param in &selection.params {
+                if let Some((_, value)) = self
+                    .param_values
+                    .iter_mut()
+                    .find(|(id, _)| id == &param.id)
+                {
+                    *value = param.value.clone();
+                }
+            }
         }
     }
 
     pub fn move_up(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
+        match self.focus {
+            ModelPickerFocus::Models => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    self.sync_params_for_cursor();
+                }
+            }
+            ModelPickerFocus::Parameters => {
+                if self.param_cursor > 0 {
+                    self.param_cursor -= 1;
+                } else {
+                    self.focus = ModelPickerFocus::Models;
+                }
+            }
         }
     }
 
     pub fn move_down(&mut self) {
-        if self.cursor + 1 < self.models.len() {
-            self.cursor += 1;
+        match self.focus {
+            ModelPickerFocus::Models => {
+                if self.cursor + 1 < self.models.len() {
+                    self.cursor += 1;
+                    self.sync_params_for_cursor();
+                } else if self.selected_model().is_some_and(|m| !m.parameters.is_empty()) {
+                    self.focus = ModelPickerFocus::Parameters;
+                    self.param_cursor = 0;
+                }
+            }
+            ModelPickerFocus::Parameters => {
+                let count = self.param_row_count();
+                if self.param_cursor + 1 < count {
+                    self.param_cursor += 1;
+                }
+            }
         }
     }
 
-    pub fn selected(&self) -> Option<&ModelInfo> {
+    pub fn focus_parameters(&mut self) {
+        if self.param_row_count() > 0 {
+            self.focus = ModelPickerFocus::Parameters;
+            self.param_cursor = 0;
+        }
+    }
+
+    pub fn focus_models(&mut self) {
+        self.focus = ModelPickerFocus::Models;
+    }
+
+    pub fn cycle_param_value(&mut self, delta: i32) {
+        let Some(def) = self
+            .selected_model()
+            .and_then(|m| m.parameters.get(self.param_cursor))
+            .cloned()
+        else {
+            return;
+        };
+        let Some((_, value)) = self
+            .param_values
+            .iter_mut()
+            .find(|(id, _)| id == &def.id)
+        else {
+            return;
+        };
+        let idx = def
+            .values
+            .iter()
+            .position(|v| v.value == *value)
+            .unwrap_or(0);
+        let len = def.values.len();
+        if len == 0 {
+            return;
+        }
+        let next = (idx as i32 + delta).rem_euclid(len as i32) as usize;
+        value.clone_from(&def.values[next].value);
+    }
+
+    pub fn selected_model(&self) -> Option<&ModelInfo> {
         self.models.get(self.cursor)
+    }
+
+    pub fn selected(&self) -> Option<&ModelInfo> {
+        self.selected_model()
+    }
+
+    pub fn has_parameters(&self) -> bool {
+        self.param_row_count() > 0
+    }
+
+    pub fn param_row_count(&self) -> usize {
+        self.selected_model()
+            .map(|m| m.parameters.len())
+            .unwrap_or(0)
+    }
+
+    pub fn build_selection(&self) -> Option<ModelSelection> {
+        let model = self.selected_model()?;
+        let params = self
+            .param_values
+            .iter()
+            .map(|(id, value)| ModelParameterValue {
+                id: id.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        Some(ModelSelection {
+            id: model.id.clone(),
+            params,
+        })
+    }
+
+    fn sync_params_for_cursor(&mut self) {
+        self.param_values.clear();
+        self.param_cursor = 0;
+        self.focus = ModelPickerFocus::Models;
+        let Some(model) = self.models.get(self.cursor) else {
+            return;
+        };
+        for def in &model.parameters {
+            let default = def
+                .values
+                .first()
+                .map(|v| v.value.clone())
+                .unwrap_or_default();
+            self.param_values.push((def.id.clone(), default));
+        }
     }
 }
 
@@ -522,7 +673,8 @@ fn render_approval(a: &ApprovalOverlay, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_model_picker(m: &ModelPickerOverlay, area: Rect, buf: &mut Buffer) {
-    let rect = centered_rect(64, 16, area);
+    let height = if m.has_parameters() { 22 } else { 16 };
+    let rect = centered_rect(64, height, area);
     Clear.render(rect, buf);
     let block = Block::default()
         .title(" /model ")
@@ -531,8 +683,6 @@ fn render_model_picker(m: &ModelPickerOverlay, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(rect);
     block.render(rect, buf);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Replaces the blank spacer row with a scroll-position indicator when
-    // the list overflows the visible window, keeping total rows constant.
     let mut spacer = Line::from("");
     if m.loading {
         lines.push(Line::from(Span::styled(
@@ -550,41 +700,53 @@ fn render_model_picker(m: &ModelPickerOverlay, area: Rect, buf: &mut Buffer) {
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        // Scroll window: the hint block below takes 2 rows of `inner`;
-        // window the list around the cursor so it never clips off the
-        // bottom of the overlay when there are more models than rows.
-        let visible = (inner.height as usize).saturating_sub(2).max(1);
+        let param_rows = if m.has_parameters() {
+            m.param_row_count() + 2
+        } else {
+            0
+        };
+        let hint_rows = 2usize;
+        let model_visible = (inner.height as usize)
+            .saturating_sub(hint_rows + param_rows)
+            .max(1);
         let cursor = m.cursor.min(m.models.len().saturating_sub(1));
-        let start = (cursor + 1).saturating_sub(visible);
+        let start = (cursor + 1).saturating_sub(model_visible);
         let more_above = start > 0;
-        let more_below = start + visible < m.models.len();
+        let more_below = start + model_visible < m.models.len();
         for (i, model) in m
             .models
             .iter()
             .enumerate()
             .skip(start)
-            .take(visible)
+            .take(model_visible)
         {
             let selected = i == m.cursor;
-            let marker = if selected { "› " } else { "  " };
-            let mut spans = vec![Span::styled(
-                marker.to_string(),
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            )];
-            let name_style = if selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            let focused = m.focus == ModelPickerFocus::Models && selected;
+            let marker = if focused {
+                "› "
+            } else if selected {
+                "• "
             } else {
-                Style::default().fg(Color::White)
+                "  "
             };
-            spans.push(Span::styled(model.id.clone(), name_style));
-            if let Some(display) = &model.display_name {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    display.clone(),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            lines.push(Line::from(spans));
+            let label = model
+                .display_name
+                .as_deref()
+                .unwrap_or(model.id.as_str());
+            let name_style = if focused {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else if selected {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    marker.to_string(),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(label.to_string(), name_style),
+            ]));
         }
         if more_above || more_below {
             let mut hint = format!("{}/{}", cursor + 1, m.models.len());
@@ -599,10 +761,59 @@ fn render_model_picker(m: &ModelPickerOverlay, area: Rect, buf: &mut Buffer) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
+
+        if m.has_parameters() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "options",
+                Style::default().fg(Color::DarkGray),
+            )));
+            if let Some(model) = m.selected_model() {
+                for (idx, def) in model.parameters.iter().enumerate() {
+                    let focused =
+                        m.focus == ModelPickerFocus::Parameters && idx == m.param_cursor;
+                    let marker = if focused { "› " } else { "  " };
+                    let current = m
+                        .param_values
+                        .iter()
+                        .find(|(id, _)| id == &def.id)
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
+                    let value_label = def
+                        .values
+                        .iter()
+                        .find(|v| v.value == current)
+                        .and_then(|v| v.display_name.as_deref())
+                        .unwrap_or(current);
+                    let name = def.display_name.as_deref().unwrap_or(def.id.as_str());
+                    let label_style = if focused {
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            marker.to_string(),
+                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("{name}: "), label_style),
+                        Span::styled(
+                            format!("‹ {value_label} ›"),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                    ]));
+                }
+            }
+        }
     }
     lines.push(spacer);
+    let hint = if m.has_parameters() {
+        "↑/↓ navigate · ←/→ adjust · Tab options · Enter apply · Esc cancel"
+    } else {
+        "↑/↓ select · Enter apply · Esc cancel"
+    };
     lines.push(Line::from(Span::styled(
-        "↑/↓ select · Enter apply · Esc cancel",
+        hint,
         Style::default().fg(Color::Cyan),
     )));
     Paragraph::new(lines).wrap(Wrap { trim: false }).render(inner, buf);
@@ -1132,16 +1343,19 @@ mod tests {
                 display_name: Some("Composer 2.5".into()),
                 provider: None,
                 supports_thinking: false,
+                parameters: vec![],
             },
             ModelInfo {
                 id: "claude-sonnet-4".into(),
                 display_name: None,
                 provider: None,
                 supports_thinking: true,
+                parameters: vec![],
             },
         ]));
         let out = render(&overlay, 80, 20);
-        assert!(out.contains("composer-2.5"));
+        assert!(out.contains("Composer 2.5"));
+        assert!(!out.contains("composer-2.5"));
         assert!(out.contains("claude-sonnet-4"));
         assert!(out.contains("↑/↓ select"));
     }
@@ -1157,6 +1371,7 @@ mod tests {
                 display_name: None,
                 provider: None,
                 supports_thinking: false,
+                parameters: vec![],
             })
             .collect();
         let mut picker = ModelPickerOverlay::populated(models);
@@ -1185,12 +1400,91 @@ mod tests {
                 display_name: None,
                 provider: None,
                 supports_thinking: false,
+                parameters: vec![],
             })
             .collect();
         let out = render(&Overlay::ModelPicker(ModelPickerOverlay::populated(models)), 80, 24);
         assert!(out.contains("model-0"));
         assert!(out.contains("model-2"));
         assert!(!out.contains("more"), "no indicator for short lists: {out}");
+    }
+
+    #[test]
+    fn spec_016_model_picker_renders_parameter_controls() {
+        use cusa_rpc::{ModelParameterDefinition, ModelParameterValueOption};
+        let overlay = Overlay::ModelPicker(ModelPickerOverlay::populated(vec![ModelInfo {
+            id: "composer-2.5".into(),
+            display_name: Some("Composer 2.5".into()),
+            provider: None,
+            supports_thinking: false,
+            parameters: vec![
+                ModelParameterDefinition {
+                    id: "effort".into(),
+                    display_name: Some("Effort".into()),
+                    values: vec![
+                        ModelParameterValueOption {
+                            value: "low".into(),
+                            display_name: Some("Low".into()),
+                        },
+                        ModelParameterValueOption {
+                            value: "high".into(),
+                            display_name: Some("High".into()),
+                        },
+                    ],
+                },
+                ModelParameterDefinition {
+                    id: "fast".into(),
+                    display_name: Some("Fast".into()),
+                    values: vec![
+                        ModelParameterValueOption {
+                            value: "false".into(),
+                            display_name: Some("Off".into()),
+                        },
+                        ModelParameterValueOption {
+                            value: "true".into(),
+                            display_name: Some("On".into()),
+                        },
+                    ],
+                },
+            ],
+        }]));
+        let out = render(&overlay, 80, 24);
+        assert!(out.contains("options"));
+        assert!(out.contains("Effort"));
+        assert!(out.contains("Fast"));
+        assert!(out.contains("←/→ adjust"));
+    }
+
+    #[test]
+    fn spec_016_model_picker_builds_selection_with_params() {
+        use cusa_rpc::{ModelParameterDefinition, ModelParameterValueOption};
+        let mut picker = ModelPickerOverlay::populated(vec![ModelInfo {
+            id: "composer-2.5".into(),
+            display_name: Some("Composer 2.5".into()),
+            provider: None,
+            supports_thinking: false,
+            parameters: vec![ModelParameterDefinition {
+                id: "effort".into(),
+                display_name: Some("Effort".into()),
+                values: vec![
+                    ModelParameterValueOption {
+                        value: "low".into(),
+                        display_name: None,
+                    },
+                    ModelParameterValueOption {
+                        value: "high".into(),
+                        display_name: None,
+                    },
+                ],
+            }],
+        }]);
+        picker.focus_parameters();
+        picker.cycle_param_value(1);
+        let sel = picker.build_selection().expect("selection");
+        assert_eq!(sel.id, "composer-2.5");
+        assert_eq!(sel.params.len(), 1);
+        assert_eq!(sel.params[0].id, "effort");
+        assert_eq!(sel.params[0].value, "high");
     }
 
     #[test]
