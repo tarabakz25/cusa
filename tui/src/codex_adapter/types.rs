@@ -9,6 +9,8 @@
 pub enum RouterSourceView {
     Rule,
     Llm,
+    /// Local semantic classifier (Super Auto Mode, issue #7).
+    Local,
     Override,
     Fallback,
 }
@@ -20,6 +22,7 @@ impl RouterSourceView {
             Self::Override => "override",
             Self::Rule => "rule",
             Self::Llm => "llm",
+            Self::Local => "local",
             Self::Fallback => "fallback",
         }
     }

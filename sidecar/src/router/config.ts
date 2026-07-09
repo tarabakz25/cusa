@@ -17,16 +17,28 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 import { builtInDefaultRules } from "./rules.js";
-import type { RouterConfig, RuleMatch, RuleSpec } from "./types.js";
+import { BUILTIN_EMBEDDER_ID } from "./localClassifier.js";
+import { providerOf } from "./modelResolver.js";
+import type { ExemplarSpec, RouterConfig, RuleMatch, RuleSpec } from "./types.js";
 
 /** Reasonable defaults when the user has no `~/.cusa/router.toml`. */
 export function builtInDefaultConfig(): RouterConfig {
   return {
     defaultModel: "composer-2.5",
     llmEnabled: true,
-    llmTimeoutMs: 5000,
+    // NFR-1: LLM classification path must settle in ≤ 1500 ms p95, so the
+    // hard timeout defaults to exactly that budget (was 5000; issue #7).
+    llmTimeoutMs: 1500,
     llmClassifierModel: "composer-2.5",
     rules: [...builtInDefaultRules],
+    // Super Auto Mode (issue #7) — OFF by default so the legacy "auto"
+    // pipeline is untouched until the user opts in.
+    localClassifierEnabled: false,
+    thetaHigh: 0.55,
+    thetaLow: 0.35,
+    embeddingModel: BUILTIN_EMBEDDER_ID,
+    allowedProviders: ["composer", "claude", "gpt", "gemini", "grok"],
+    exemplars: [],
   };
 }
 
@@ -195,14 +207,24 @@ interface ParseResult {
  * Parse the strict router.toml subset the spec documents:
  *   default_model = "id"
  *   llm_enabled = true
- *   llm_timeout_ms = 5000
+ *   llm_timeout_ms = 1500
  *   llm_classifier_model = "id"
+ *   local_classifier_enabled = true        # Super Auto Mode (issue #7)
+ *   theta_high = 0.55
+ *   theta_low = 0.35
+ *   embedding_model = "builtin:hash-ngram-v1"   # pinned; never auto-updated
+ *   allowed_providers = ["composer", "claude", "gpt", "gemini", "grok"]
  *
  *   [[rule]]
  *   name = "..."
  *   model = "..."
  *   rationale = "..."
  *   match = { any_of = [...], keywords = [...], min_length = 200 }
+ *
+ *   [[exemplars]]
+ *   model = "claude-sonnet"                # family alias → resolved latest
+ *   rationale = "long-form reasoning"
+ *   examples = ["prove that ...", "design the architecture for ..."]
  *
  * We do not depend on a real TOML parser; the subset is small and
  * unambiguous. Unknown top-level keys are ignored with a warning.
@@ -214,31 +236,56 @@ export function parseRouterTomlSafe(text: string): ParseResult {
   cfg.rules = [];
 
   let inRule = false;
+  let explicitAllowlist = false;
   let currentRule: Partial<{
     name: string;
     model: string;
     rationale: string;
     match: RuleMatch;
   }> | null = null;
+  let inExemplar = false;
+  let currentExemplar: Partial<ExemplarSpec> | null = null;
 
   const flush = () => {
-    if (!currentRule) return;
-    if (
-      typeof currentRule.name !== "string" ||
-      typeof currentRule.model !== "string" ||
-      typeof currentRule.rationale !== "string" ||
-      !currentRule.match
-    ) {
-      errors.push(`rule missing required fields: ${JSON.stringify(currentRule)}`);
-    } else {
-      cfg.rules.push({
-        name: currentRule.name,
-        model: currentRule.model,
-        rationale: currentRule.rationale,
-        match: currentRule.match,
-      });
+    if (currentRule) {
+      if (
+        typeof currentRule.name !== "string" ||
+        typeof currentRule.model !== "string" ||
+        typeof currentRule.rationale !== "string" ||
+        !currentRule.match
+      ) {
+        errors.push(
+          `rule missing required fields: ${JSON.stringify(currentRule)}`,
+        );
+      } else {
+        cfg.rules.push({
+          name: currentRule.name,
+          model: currentRule.model,
+          rationale: currentRule.rationale,
+          match: currentRule.match,
+        });
+      }
+      currentRule = null;
     }
-    currentRule = null;
+    if (currentExemplar) {
+      if (
+        typeof currentExemplar.model !== "string" ||
+        typeof currentExemplar.rationale !== "string" ||
+        !Array.isArray(currentExemplar.examples) ||
+        currentExemplar.examples.length === 0
+      ) {
+        errors.push(
+          `exemplar missing required fields: ${JSON.stringify(currentExemplar)}`,
+        );
+      } else {
+        cfg.exemplars.push({
+          model: currentExemplar.model,
+          rationale: currentExemplar.rationale,
+          examples: currentExemplar.examples,
+        });
+      }
+      currentExemplar = null;
+    }
   };
 
   const lines = text.split(/\r?\n/);
@@ -249,13 +296,23 @@ export function parseRouterTomlSafe(text: string): ParseResult {
     if (line === "[[rule]]") {
       flush();
       inRule = true;
+      inExemplar = false;
       currentRule = { match: {} };
+      continue;
+    }
+    if (line === "[[exemplars]]") {
+      flush();
+      inRule = false;
+      inExemplar = true;
+      currentExemplar = {};
       continue;
     }
     if (/^\[.+\]$/.test(line)) {
       flush();
       inRule = false;
+      inExemplar = false;
       currentRule = null;
+      currentExemplar = null;
       warnings.push(`ignoring unknown section ${line}`);
       continue;
     }
@@ -295,6 +352,37 @@ export function parseRouterTomlSafe(text: string): ParseResult {
       }
       continue;
     }
+    if (inExemplar) {
+      const value = parseScalarOrTable(rest, errors, lineNo + 1);
+      if (value === undefined) continue;
+      switch (key) {
+        case "model":
+        case "rationale":
+          if (typeof value !== "string") {
+            errors.push(`line ${lineNo + 1}: ${key} must be a string`);
+          } else {
+            (currentExemplar as Record<string, unknown>)[key] = value;
+          }
+          break;
+        case "examples":
+          if (
+            !Array.isArray(value) ||
+            value.some((x) => typeof x !== "string")
+          ) {
+            errors.push(
+              `line ${lineNo + 1}: examples must be an array of strings`,
+            );
+          } else {
+            currentExemplar!.examples = value as string[];
+          }
+          break;
+        default:
+          warnings.push(
+            `unknown exemplar field '${key}' at line ${lineNo + 1}`,
+          );
+      }
+      continue;
+    }
     // Top-level scalar keys.
     const value = parseScalarOrTable(rest, errors, lineNo + 1);
     if (value === undefined) continue;
@@ -331,12 +419,110 @@ export function parseRouterTomlSafe(text: string): ParseResult {
           cfg.llmClassifierModel = value;
         }
         break;
+      case "local_classifier_enabled":
+        if (typeof value !== "boolean") {
+          errors.push(
+            `line ${lineNo + 1}: local_classifier_enabled must be a boolean`,
+          );
+        } else {
+          cfg.localClassifierEnabled = value;
+        }
+        break;
+      case "theta_high":
+      case "theta_low":
+        if (typeof value !== "number" || value < -1 || value > 1) {
+          errors.push(
+            `line ${lineNo + 1}: ${key} must be a number in [-1, 1]`,
+          );
+        } else if (key === "theta_high") {
+          cfg.thetaHigh = value;
+        } else {
+          cfg.thetaLow = value;
+        }
+        break;
+      case "embedding_model":
+        if (typeof value !== "string") {
+          errors.push(`line ${lineNo + 1}: embedding_model must be a string`);
+        } else {
+          cfg.embeddingModel = value;
+        }
+        break;
+      case "allowed_providers": {
+        if (!Array.isArray(value) || value.some((x) => typeof x !== "string")) {
+          errors.push(
+            `line ${lineNo + 1}: allowed_providers must be an array of strings`,
+          );
+        } else {
+          cfg.allowedProviders = (value as string[]).map((p) =>
+            p.toLowerCase(),
+          );
+          explicitAllowlist = true;
+        }
+        break;
+      }
       default:
         warnings.push(`unknown top-level key '${key}' at line ${lineNo + 1}`);
     }
   }
   flush();
+  validateConfig(cfg, warnings, errors, explicitAllowlist);
   return { config: cfg, warnings, errors };
+}
+
+/**
+ * Post-parse validation (issue #7):
+ * - θ_low ≤ θ_high — otherwise the ambiguous band is inverted (error).
+ * - When (and only when) the file explicitly sets `allowed_providers`:
+ *   `default_model` must belong to an allowed brand — loud config error
+ *   (the loader then falls back to built-in defaults); rules / exemplars
+ *   routing to a disallowed brand are dropped with a warning;
+ *   `llm_classifier_model` outside the allowlist warns only. Configs
+ *   without an explicit allowlist keep full backward compatibility with
+ *   arbitrary model ids (the allowlist still filters the *catalog* in
+ *   super-auto mode).
+ */
+function validateConfig(
+  cfg: RouterConfig,
+  warnings: string[],
+  errors: string[],
+  explicitAllowlist: boolean,
+): void {
+  if (cfg.thetaLow > cfg.thetaHigh) {
+    errors.push(
+      `theta_low (${cfg.thetaLow}) must be <= theta_high (${cfg.thetaHigh})`,
+    );
+  }
+  if (!explicitAllowlist) return;
+  const allowed = new Set(cfg.allowedProviders);
+  const isAllowed = (id: string): boolean => {
+    if (allowed.size === 0) return true;
+    const brand = providerOf(id);
+    return brand !== null && allowed.has(brand);
+  };
+  if (!isAllowed(cfg.defaultModel)) {
+    errors.push(
+      `default_model '${cfg.defaultModel}' is not in allowed_providers [${cfg.allowedProviders.join(", ")}]`,
+    );
+  }
+  if (!isAllowed(cfg.llmClassifierModel)) {
+    warnings.push(
+      `llm_classifier_model '${cfg.llmClassifierModel}' is not in allowed_providers`,
+    );
+  }
+  cfg.rules = cfg.rules.filter((r) => {
+    if (isAllowed(r.model)) return true;
+    warnings.push(
+      `dropping rule '${r.name}': model '${r.model}' is not in allowed_providers`,
+    );
+    return false;
+  });
+  cfg.exemplars = cfg.exemplars.filter((e) => {
+    if (isAllowed(e.model)) return true;
+    warnings.push(
+      `dropping exemplar for '${e.model}': not in allowed_providers`,
+    );
+    return false;
+  });
 }
 
 function stripComment(line: string): string {
@@ -384,7 +570,7 @@ function parseScalarOrTable(
     return m[2]!.replace(/\\(.)/g, "$1");
   }
   if (t === "true" || t === "false") return t === "true";
-  if (/^-?\d+$/.test(t)) return Number(t);
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
   if (t.startsWith("[")) return parseArray(t, errors, lineNo);
   if (t.startsWith("{")) return parseInlineTable(t, errors, lineNo);
   errors.push(`line ${lineNo}: unrecognized value ${t}`);

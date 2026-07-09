@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import { approvalPolicy, shouldEnableSandbox } from "../approval/policy.js";
 import { readApiKey, type ApiKeySource } from "../config/apiKey.js";
 import { Router, type RouteContext } from "../router/index.js";
+import { appendEvalSample, evalCaptureEnabled } from "../router/evalCapture.js";
 import {
   Method,
   RpcErrorCode,
@@ -126,6 +127,12 @@ interface SessionState {
   enabledMcpServerIds: Set<string> | null;
   /** Cached one-time observational-approval warning flag. */
   observationalWarnEmitted: boolean;
+  /**
+   * Model chosen by the most recent NON-override router decision.
+   * Used as the correction signal for dev eval capture (issue #7): a
+   * manual override right after an auto decision implies a misroute.
+   */
+  lastAutoRoutedModel: string | null;
 }
 
 interface ActiveRunState {
@@ -164,6 +171,8 @@ export class SessionManager {
   private readonly readKey: typeof readApiKey;
   private readonly sessions = new Map<string, SessionState>();
   private modelsCache: ModelInfo[] | null = null;
+  private modelsCacheAt = 0;
+  private readonly now: () => number;
   private readonly router: Router;
   private readonly skills: SkillsManager;
   private readonly mcp: McpManager;
@@ -175,6 +184,7 @@ export class SessionManager {
     this.notify = opts.notify;
     this.log = opts.log ?? (() => {});
     this.readKey = opts.readApiKey ?? readApiKey;
+    this.now = opts.now ?? Date.now;
     this.router = opts.router ?? new Router({ log: this.log });
     this.skills = opts.skills ?? new SkillsManager({ log: this.log });
     this.mcp = opts.mcp ?? new McpManager({ log: this.log });
@@ -203,8 +213,19 @@ export class SessionManager {
 
   // -------- models/list -------------------------------------------------
 
+  /**
+   * Issue #7 ("always latest"): the catalog is re-fetched after a TTL so
+   * long-running sidecars see newly released models. A refresh failure
+   * with a previous snapshot in hand serves the stale snapshot instead of
+   * failing the call (offline tolerance, #5).
+   */
+  static readonly MODELS_CACHE_TTL_MS = 10 * 60_000;
+
   async listModels(): Promise<{ models: ModelInfo[] }> {
-    if (this.modelsCache) return { models: this.modelsCache };
+    const fresh =
+      this.modelsCache !== null &&
+      this.now() - this.modelsCacheAt < SessionManager.MODELS_CACHE_TTL_MS;
+    if (this.modelsCache && fresh) return { models: this.modelsCache };
     // Resolve the key here (env or ~/.cusa/config.toml) and hand it to the
     // adapter explicitly. Relying on the SDK's env-var fallback breaks the
     // config-file path and surfaces as "models/list failed" (SPEC-016).
@@ -212,8 +233,13 @@ export class SessionManager {
     try {
       const models = await this.adapter.listModels(apiKey);
       this.modelsCache = models;
+      this.modelsCacheAt = this.now();
       return { models };
     } catch (err) {
+      if (this.modelsCache) {
+        this.log("warn", "models/list refresh failed; serving stale catalog");
+        return { models: this.modelsCache };
+      }
       throw this.wrapAgentError(err, "models/list failed");
     }
   }
@@ -257,10 +283,15 @@ export class SessionManager {
         pendingApprovals: new Map(),
         enabledMcpServerIds: null, // null = "all enabled"
         observationalWarnEmitted: false,
+        lastAutoRoutedModel: null,
       };
       this.sessions.set(sessionId, state);
       this.context.registerSession(sessionId);
       this.assertSandboxCoupling(approvalMode);
+      // Issue #7 ("always latest"): opportunistically refresh the model
+      // catalog on session creation. Best-effort and non-blocking — a
+      // failure must never affect the session being created.
+      void this.listModels().catch(() => {});
       return {
         sessionId,
         agentId: agent.agentId,
@@ -302,17 +333,48 @@ export class SessionManager {
     if (session.enabledSkillIds.length > 0) {
       routeCtx.enabledSkills = [...session.enabledSkillIds];
     }
-    const decision = await this.router.route(routeCtx);
+    // Issue #7: hand the router the latest catalog snapshot we already
+    // hold (never fetched inline — routing must stay off the network).
+    if (this.modelsCache !== null) {
+      routeCtx.catalogModels = this.modelsCache.map((m) => m.id);
+    }
+
+    // Route this turn, build the system-context block (skills +
+    // conversation history), and compose the per-turn MCP server map
+    // (inline replaces creation-time) CONCURRENTLY — the three stages are
+    // independent, so per-turn overhead is max() instead of a sum
+    // (issue #7 hot-path parallelization).
+    const [decision, systemContext, mcpForTurn] = await Promise.all([
+      this.router.route(routeCtx),
+      this.buildSystemContext(session),
+      this.mcp.composeForTurn({
+        cwd: session.cwd,
+        inline: session.mcpOverrides,
+        enabledIds: session.enabledMcpServerIds,
+      }),
+    ]);
     const modelForSend = params.modelOverride ?? { id: decision.model };
 
-    // Build the system-context block (skills + conversation history) and
-    // compose the per-turn MCP server map (inline replaces creation-time).
-    const systemContext = await this.buildSystemContext(session);
-    const mcpForTurn = await this.mcp.composeForTurn({
-      cwd: session.cwd,
-      inline: session.mcpOverrides,
-      enabledIds: session.enabledMcpServerIds,
-    });
+    // Dev-only θ-tuning capture (issue #7 Phase 2). Zero cost and zero
+    // filesystem access unless CUSA_EVAL_CAPTURE=1.
+    if (evalCaptureEnabled()) {
+      const correctionOf =
+        decision.source === "override" ? session.lastAutoRoutedModel : null;
+      void appendEvalSample(
+        {
+          ts: new Date(this.now()).toISOString(),
+          prompt: params.text,
+          chosen: { id: decision.model },
+          source: decision.source,
+          rationale: decision.rationale,
+          llmConsulted: decision.source === "llm",
+          ...(correctionOf ? { correctionOf } : {}),
+        },
+        { log: (level, message) => this.log(level, message) },
+      );
+    }
+    session.lastAutoRoutedModel =
+      decision.source === "override" ? null : decision.model;
 
     let turn: TurnHandle;
     let runId: string;
@@ -809,6 +871,7 @@ export class SessionManager {
         pendingApprovals: new Map(),
         enabledMcpServerIds: null,
         observationalWarnEmitted: false,
+        lastAutoRoutedModel: null,
       };
       this.sessions.set(sessionId, state);
       this.context.registerSession(sessionId);

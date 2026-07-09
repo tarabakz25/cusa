@@ -6,6 +6,8 @@ import assert from "node:assert/strict";
 
 import { FakeSdkAdapter } from "./sdkAdapter.fake.ts";
 import { SessionManager, SessionRpcError } from "./session.ts";
+import { Router, type RouteContext } from "../router/index.ts";
+import { McpManager } from "../mcp/index.ts";
 import { RpcErrorCode } from "../rpc/schema.ts";
 
 interface Emitted {
@@ -424,6 +426,116 @@ test("SPEC-024: full-auto skips tool/approvalRequest for write tools", async () 
   assert.equal(
     emitted.filter((e) => e.method === "tool/approvalRequest").length,
     0,
+  );
+});
+
+// ----------------------------------------------------------------------
+// Issue #7 — models cache TTL, catalog handoff, parallel hot path
+// ----------------------------------------------------------------------
+
+test("#7: models/list refetches after the TTL expires (always-latest)", async () => {
+  const adapter = new FakeSdkAdapter();
+  let clock = 1_000_000;
+  const mgr = new SessionManager({
+    adapter,
+    notify: () => {},
+    readApiKey: async () => ({ key: "sk_test", origin: "env" }),
+    now: () => clock,
+  });
+  await mgr.listModels();
+  await mgr.listModels();
+  assert.equal(adapter.state.listModelsKeys.length, 1, "within TTL → cached");
+  clock += SessionManager.MODELS_CACHE_TTL_MS + 1;
+  await mgr.listModels();
+  assert.equal(adapter.state.listModelsKeys.length, 2, "past TTL → refetched");
+});
+
+test("#7: a failed refresh serves the stale catalog instead of erroring", async () => {
+  const adapter = new FakeSdkAdapter();
+  let failNext = false;
+  const originalListModels = adapter.listModels.bind(adapter);
+  adapter.listModels = async (apiKey: string) => {
+    if (failNext) throw new Error("network down");
+    return originalListModels(apiKey);
+  };
+  let clock = 1_000_000;
+  const mgr = new SessionManager({
+    adapter,
+    notify: () => {},
+    readApiKey: async () => ({ key: "sk_test", origin: "env" }),
+    now: () => clock,
+  });
+  const first = await mgr.listModels();
+  clock += SessionManager.MODELS_CACHE_TTL_MS + 1;
+  failNext = true;
+  const second = await mgr.listModels();
+  assert.deepEqual(second.models, first.models, "stale snapshot served");
+});
+
+test("#7: sendMessage hands the cached catalog to the router as RouteContext", async () => {
+  const emitted: Emitted[] = [];
+  const adapter = new FakeSdkAdapter();
+  const router = new Router();
+  let captured: RouteContext | null = null;
+  const originalRoute = router.route.bind(router);
+  router.route = async (ctx: RouteContext) => {
+    captured = ctx;
+    return originalRoute(ctx);
+  };
+  const mgr = new SessionManager({
+    adapter,
+    notify: (method, params) => emitted.push({ method, params }),
+    readApiKey: async () => ({ key: "sk_test", origin: "env" }),
+    router,
+  });
+  await mgr.listModels();
+  const create = await mgr.createSession({ cwd: "/tmp/repo" });
+  adapter.script({ events: [], result: { status: "finished" } });
+  await mgr.sendMessage({ sessionId: create.sessionId, text: "hi there" });
+  await until(() => emitted.some((e) => e.method === "run/finished"));
+  assert.ok(captured);
+  assert.deepEqual(captured!.catalogModels, ["composer-2.5", "claude-sonnet-4"]);
+});
+
+test("#7: route/context/mcp stages run concurrently (max, not sum)", async () => {
+  const adapter = new FakeSdkAdapter();
+  const emitted: Emitted[] = [];
+  let concurrent = 0;
+  let maxConcurrent = 0;
+  const enter = async () => {
+    concurrent++;
+    maxConcurrent = Math.max(maxConcurrent, concurrent);
+    await new Promise((r) => setTimeout(r, 20));
+    concurrent--;
+  };
+  const router = new Router();
+  const originalRoute = router.route.bind(router);
+  router.route = async (ctx: RouteContext) => {
+    await enter();
+    return originalRoute(ctx);
+  };
+  class SlowMcp extends McpManager {
+    override async composeForTurn(
+      args: Parameters<McpManager["composeForTurn"]>[0],
+    ): ReturnType<McpManager["composeForTurn"]> {
+      await enter();
+      return super.composeForTurn(args);
+    }
+  }
+  const mgr = new SessionManager({
+    adapter,
+    notify: (method, params) => emitted.push({ method, params }),
+    readApiKey: async () => ({ key: "sk_test", origin: "env" }),
+    router,
+    mcp: new SlowMcp({ log: () => {} }),
+  });
+  const create = await mgr.createSession({ cwd: "/tmp/repo" });
+  adapter.script({ events: [], result: { status: "finished" } });
+  await mgr.sendMessage({ sessionId: create.sessionId, text: "hello" });
+  await until(() => emitted.some((e) => e.method === "run/finished"));
+  assert.ok(
+    maxConcurrent >= 2,
+    `router.route and mcp.composeForTurn must overlap (max=${maxConcurrent})`,
   );
 });
 

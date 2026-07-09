@@ -157,8 +157,8 @@ test("Rust ApprovalMode kebab-case values match TS union", () => {
 });
 
 test("Rust router source camelCase values match TS union", () => {
-  const expected = new Set<string>(["rule", "llm", "override", "fallback"]);
-  const literals: string[] = ["rule", "llm", "override", "fallback"];
+  const expected = new Set<string>(["rule", "llm", "local", "override", "fallback"]);
+  const literals: string[] = ["rule", "llm", "local", "override", "fallback"];
   for (const l of literals) assert.ok(expected.has(l));
 });
 

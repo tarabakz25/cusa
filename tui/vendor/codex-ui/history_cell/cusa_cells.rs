@@ -21,6 +21,7 @@ use super::PlainHistoryCell;
 pub enum RouterSourceStyle {
     Rule,
     Llm,
+    Local,
     Override,
     Fallback,
 }
@@ -31,6 +32,7 @@ impl RouterSourceStyle {
             Self::Override => Color::Yellow,
             Self::Rule => Color::Cyan,
             Self::Llm => Color::Magenta,
+            Self::Local => Color::Green,
             Self::Fallback => Color::DarkGray,
         }
     }
@@ -40,6 +42,7 @@ impl RouterSourceStyle {
             Self::Override => "override",
             Self::Rule => "rule",
             Self::Llm => "llm",
+            Self::Local => "local",
             Self::Fallback => "fallback",
         }
     }

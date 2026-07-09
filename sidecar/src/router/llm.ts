@@ -34,7 +34,8 @@ export interface ClassifierResult {
 
 /**
  * Build the deterministic classifier prompt. We keep it short so the
- * classifier LLM can turn around inside the 5 s budget.
+ * classifier LLM can turn around inside the llm_timeout_ms budget
+ * (default 1500 ms, NFR-1).
  */
 export function buildClassifierPrompt(
   userPrompt: string,

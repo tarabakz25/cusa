@@ -87,6 +87,37 @@ function matches(m: RuleMatch, prompt: string): boolean {
 }
 
 /**
+ * Structural gate (issue #7, super-auto mode only): ~0 ms deterministic
+ * checks that confidently identify "fast default model" turns before any
+ * semantic classification runs — code fences, stack traces, slash-command
+ * lookalikes, and very short prompts. Returns a rationale for the router
+ * line, or `null` when no gate fires. The Router maps a hit onto the
+ * configured default model with source "rule".
+ */
+export function structuralGate(prompt: string): { rationale: string } | null {
+  const trimmed = prompt.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.includes("```")) {
+    return { rationale: "structural: code fence" };
+  }
+  if (
+    /(^|\n)\s*at .+:\d+/.test(trimmed) ||
+    /Traceback \(most recent call last\)/.test(trimmed) ||
+    /(^|\n)\s*panic:/.test(trimmed) ||
+    /(^|\n)\s*File ".+", line \d+/.test(trimmed)
+  ) {
+    return { rationale: "structural: stack trace" };
+  }
+  if (trimmed.startsWith("/") && !trimmed.includes("\n")) {
+    return { rationale: "structural: slash-command-like" };
+  }
+  if (trimmed.length <= 20) {
+    return { rationale: "structural: very short prompt" };
+  }
+  return null;
+}
+
+/**
  * A conservative set of built-in rules used when the user has no
  * `~/.cusa/router.toml`. Keeps common short prompts on the fast model.
  */

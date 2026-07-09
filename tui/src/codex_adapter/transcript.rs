@@ -83,6 +83,7 @@ fn map_router_source(source: RouterSourceView) -> RouterSourceStyle {
     match source {
         RouterSourceView::Rule => RouterSourceStyle::Rule,
         RouterSourceView::Llm => RouterSourceStyle::Llm,
+        RouterSourceView::Local => RouterSourceStyle::Local,
         RouterSourceView::Override => RouterSourceStyle::Override,
         RouterSourceView::Fallback => RouterSourceStyle::Fallback,
     }
