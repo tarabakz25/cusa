@@ -17,8 +17,10 @@
 //   * `Skills` — togglable skills overlay (SPEC-032).
 //   * `Mcp` — MCP server list + expandable rows (SPEC-042).
 
+use crate::app::startup::relative_time;
 use crate::app::state::ContextStrategy;
 use crate::app::usage::UsageSnapshot;
+use crate::session_store::StoredSession;
 use cusa_rpc::{
     ApprovalMode, McpServerInfo, McpServerStatus, ModelInfo, ModelParameterDefinition,
     ModelParameterValue, ModelSelection, SkillInfo, ToolCategory,
@@ -448,6 +450,50 @@ pub struct ContextOverlay {
     pub current: ContextStrategy,
 }
 
+/// In-TUI `/resume` picker (sessions only; Esc cancels).
+#[derive(Debug, Clone)]
+pub struct ResumeOverlay {
+    pub candidates: Vec<StoredSession>,
+    pub selected: usize,
+    pub cwd: String,
+    /// True while dispose → resume RPC is in flight.
+    pub busy: bool,
+}
+
+impl ResumeOverlay {
+    pub fn new(mut candidates: Vec<StoredSession>, cwd: String) -> Self {
+        candidates.truncate(crate::app::startup::MAX_CANDIDATES);
+        Self {
+            candidates,
+            selected: 0,
+            cwd,
+            busy: false,
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.busy {
+            return;
+        }
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.busy {
+            return;
+        }
+        if self.selected + 1 < self.candidates.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub fn selected_session(&self) -> Option<&StoredSession> {
+        self.candidates.get(self.selected)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum Overlay {
     #[default]
@@ -475,6 +521,8 @@ pub enum Overlay {
     Cost(CostOverlay),
     /// Context strategy info pane (SPEC-092).
     Context(ContextOverlay),
+    /// Resume prior session picker (SPEC-003 / SPEC-051).
+    Resume(ResumeOverlay),
 }
 
 impl Overlay {
@@ -493,6 +541,7 @@ impl Overlay {
                 | Overlay::Mcp(_)
                 | Overlay::Cost(_)
                 | Overlay::Context(_)
+                | Overlay::Resume(_)
         )
     }
 
@@ -551,8 +600,77 @@ impl<'a> Widget for OverlayWidget<'a> {
             Overlay::Mcp(m) => render_mcp(m, area, buf),
             Overlay::Cost(c) => render_cost(c, area, buf),
             Overlay::Context(c) => render_context(c, area, buf),
+            Overlay::Resume(r) => render_resume(r, area, buf),
         }
     }
+}
+
+fn render_resume(r: &ResumeOverlay, area: Rect, buf: &mut Buffer) {
+    let height = (r.candidates.len() as u16).saturating_add(6).clamp(8, 20);
+    let rect = centered_rect(72, height, area);
+    Clear.render(rect, buf);
+    let block = Block::default()
+        .title(" /resume ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("cwd: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(r.cwd.clone(), Style::default().fg(Color::White)),
+    ]));
+    lines.push(Line::from(""));
+    if r.busy {
+        lines.push(Line::from(Span::styled(
+            "resuming…",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, s) in r.candidates.iter().enumerate() {
+            let selected = i == r.selected;
+            let marker = if selected { "› " } else { "  " };
+            let mut spans = vec![Span::styled(
+                marker.to_string(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            spans.push(Span::styled(
+                "Resume ".to_string(),
+                Style::default().fg(Color::Cyan),
+            ));
+            spans.push(Span::styled(
+                s.short_agent_id(),
+                if selected {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ));
+            spans.push(Span::styled(
+                format!(
+                    "  ·  {}  ·  {} turns  ·  {}",
+                    s.model,
+                    s.turns,
+                    relative_time(s.last_used_at),
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::from(spans));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ (j/k) select · Enter resume · Esc cancel",
+        Style::default().fg(Color::Cyan),
+    )));
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(inner, buf);
 }
 
 fn render_help(area: Rect, buf: &mut Buffer) {
