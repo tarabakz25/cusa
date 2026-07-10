@@ -303,13 +303,6 @@ async fn handshake(
     if let Some(agent_id) = result.get("agentId").and_then(|v| v.as_str()) {
         state.session.agent_id = Some(agent_id.to_string());
     }
-    // `session/resume` omits agentId in the RPC result; hydrate from the
-    // requested id so session-store updates keep working after CLI resume.
-    if state.session.agent_id.is_none() {
-        if let Some(agent_id) = &cli.resume {
-            state.session.agent_id = Some(agent_id.clone());
-        }
-    }
     if let Some(model) = result.get("model").and_then(|v| v.as_str()) {
         state.session.model = model.to_string();
     }
