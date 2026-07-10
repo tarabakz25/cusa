@@ -12,6 +12,7 @@ pub mod login;
 pub mod mcp;
 pub mod model_picker;
 pub mod overlay;
+pub mod resume;
 pub mod selection;
 pub mod skills;
 pub mod slash;
@@ -366,6 +367,9 @@ pub fn apply_internal_event(state: &mut AppState, event: AppInternalEvent) {
         AppInternalEvent::SendPromptFailed(message) => {
             state.on_send_failed(message);
         }
+        AppInternalEvent::SessionResumed(result) => {
+            resume::apply_result(state, result);
+        }
     }
 }
 
@@ -681,8 +685,36 @@ fn handle_overlay_key(state: &mut AppState, client: &SidecarClient, code: KeyCod
         Overlay::ApprovalPicker(_) => handle_approval_picker_key(state, code),
         Overlay::Skills(_) => handle_skills_key(state, client, code),
         Overlay::Mcp(_) => handle_mcp_key(state, client, code),
+        Overlay::Resume(_) => handle_resume_key(state, client, code),
         _ => KeyOutcome::Handled,
     }
+}
+
+fn handle_resume_key(state: &mut AppState, client: &SidecarClient, code: KeyCode) -> KeyOutcome {
+    match code {
+        KeyCode::Esc => {
+            if let Overlay::Resume(overlay) = &state.overlay {
+                if !overlay.busy {
+                    state.overlay = Overlay::None;
+                }
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Overlay::Resume(overlay) = &mut state.overlay {
+                overlay.move_up();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Overlay::Resume(overlay) = &mut state.overlay {
+                overlay.move_down();
+            }
+        }
+        KeyCode::Enter => {
+            resume::commit(state, client);
+        }
+        _ => {}
+    }
+    KeyOutcome::Handled
 }
 
 fn handle_model_picker_key(state: &mut AppState, code: KeyCode) -> KeyOutcome {
@@ -1001,6 +1033,14 @@ pub fn dispatch_slash(state: &mut AppState, client: &SidecarClient, cmd: SlashCo
             }
             KeyOutcome::Handled
         }
+        SlashCommand::Resume(arg) => {
+            if arg.trim().is_empty() {
+                resume::open(state);
+            } else {
+                resume::resume_direct(state, client, &arg);
+            }
+            KeyOutcome::Handled
+        }
         SlashCommand::Unknown(name) => {
             state.overlay = Overlay::Toast {
                 message: format!("unknown command: /{name}"),
@@ -1008,14 +1048,6 @@ pub fn dispatch_slash(state: &mut AppState, client: &SidecarClient, cmd: SlashCo
             };
             KeyOutcome::Handled
         }
-        stub if stub.is_stub() => {
-            state.overlay = Overlay::Toast {
-                message: format!("{stub} — not yet implemented in this slice"),
-                created: Instant::now(),
-            };
-            KeyOutcome::Handled
-        }
-        _ => KeyOutcome::Handled,
     }
 }
 
@@ -1419,16 +1451,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spec_002_remaining_stub_slash_shows_toast() {
-        // `/cost` and `/context` graduated from stubs to real overlays in
-        // Phase E; only `/resume` remains as a stub until the resume-flow
-        // UI is wired end-to-end. Update this test if that changes.
-        let mut state = AppState::new("/tmp".into());
+    async fn spec_003_resume_slash_opens_picker_or_toasts_empty() {
+        let mut state = AppState::new("/tmp/resume-cwd".into());
         let (client, _peer) = SidecarClient::in_memory();
-        let stub = SlashCommand::Resume(String::new());
-        dispatch_slash(&mut state, &client, stub);
-        assert!(state.overlay.is_toast(), "stub should show toast");
-        state.overlay = Overlay::None;
+        // No store → toast.
+        dispatch_slash(&mut state, &client, SlashCommand::Resume(String::new()));
+        assert!(state.overlay.is_toast());
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "cusa-resume-slash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::session_store::SessionStore::new(dir.join("sessions.json"));
+        store
+            .record_new(crate::session_store::StoredSession {
+                agent_id: "agent-slash-dddddddd".into(),
+                cwd: "/tmp/resume-cwd".into(),
+                model: "composer-2.5".into(),
+                approval_mode: ApprovalMode::Suggest,
+                enabled_skill_ids: vec![],
+                mcp_overrides: None,
+                created_at: 1,
+                last_used_at: 1,
+                turns: 1,
+            })
+            .unwrap();
+        state.session_store = Some(store);
+        dispatch_slash(&mut state, &client, SlashCommand::Resume(String::new()));
+        assert!(
+            matches!(state.overlay, Overlay::Resume(_)),
+            "expected Resume overlay"
+        );
     }
 
     #[tokio::test]

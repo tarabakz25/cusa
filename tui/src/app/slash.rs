@@ -45,9 +45,8 @@ pub enum SlashCommand {
     /// `summary` (case-insensitive).
     Context(Option<String>),
 
-    // Remaining stubs — future slices will fill these in. The argument
-    // text is preserved so later slices can parse it without changing the
-    // caller.
+    /// `/resume` (SPEC-003 / SPEC-051..053). Empty args open the picker;
+    /// a non-empty arg resumes by agent id, prefix, or 1-based index.
     Resume(String),
 
     /// Unknown command name; caller shows an error toast.
@@ -77,7 +76,7 @@ impl SlashCommand {
     /// True if this variant is still stubbed and should surface a
     /// "not implemented yet" toast when invoked.
     pub fn is_stub(&self) -> bool {
-        matches!(self, SlashCommand::Resume(_))
+        false
     }
 }
 
@@ -156,7 +155,7 @@ pub fn help_entries() -> &'static [(&'static str, &'static str)] {
         ("/skills", "Toggle skill injection."),
         ("/mcp", "Inspect / toggle MCP servers."),
         ("/cost", "Show per-turn cost + per-model aggregates."),
-        ("/resume", "Resume a prior session (stub)."),
+        ("/resume [id|prefix|index]", "Resume a prior session for this directory."),
         ("/context strategy=<auto|raw|summary>", "Force history injection strategy."),
     ]
 }
@@ -333,8 +332,13 @@ mod tests {
     }
 
     #[test]
-    fn spec_002_remaining_resume_stub_preserves_args() {
-        assert!(parse("/resume").unwrap().is_stub());
+    fn spec_003_resume_parses_args_and_is_not_stub() {
+        assert_eq!(parse("/resume"), Some(SlashCommand::Resume(String::new())));
+        assert_eq!(
+            parse("/resume abc123"),
+            Some(SlashCommand::Resume("abc123".into()))
+        );
+        assert!(!parse("/resume").unwrap().is_stub());
         assert!(!parse("/cost").unwrap().is_stub());
         assert!(!parse("/context").unwrap().is_stub());
     }
