@@ -203,6 +203,11 @@ pub struct AppState {
     /// Rendered as a REVERSED overlay; releasing the button copies the
     /// covered text and clears this.
     pub selection: Option<crate::app::selection::Selection>,
+    /// Transcript scrollback offset in wrapped display lines above the
+    /// bottom-pinned position. `0` = follow the newest output (default);
+    /// wheel / PageUp increase it to reveal older history. Clamped against
+    /// the current content height on every change and at render time.
+    pub transcript_scroll: usize,
 }
 
 impl AppState {
@@ -242,6 +247,7 @@ impl AppState {
             slash_popup_selected: 0,
             slash_popup_dismissed: false,
             selection: None,
+            transcript_scroll: 0,
         }
     }
 
@@ -291,6 +297,9 @@ impl AppState {
             .push(TranscriptEntry::User(prompt.clone()));
         self.current_turn = Some(TurnState::new(prompt));
         self.phase = RunPhase::Sending;
+        // Sending a prompt jumps the transcript back to the live tail so the
+        // new turn's output is visible even if the user had scrolled up.
+        self.transcript_scroll = 0;
     }
 
     /// Called when `router/decision` arrives. Captures the sidecar-assigned

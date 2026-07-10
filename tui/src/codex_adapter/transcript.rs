@@ -175,13 +175,18 @@ pub fn render_transcript_lines(cells: &[Arc<dyn HistoryCell>], width: u16) -> Ve
 }
 
 /// Codex-style transcript pane replacing legacy `TranscriptWidget` (SPEC-107).
+///
+/// The pane is pinned to the *bottom* of the transcript: when the content is
+/// taller than the viewport, the newest output stays visible and older lines
+/// scroll off the top. `scroll_up` moves the viewport back into history
+/// (wheel / PageUp scrollback); `0` means "follow the latest output".
 #[derive(Debug)]
 pub struct CodexTranscriptWidget<'a> {
     entries: &'a [TranscriptEntry],
     live_turn: Option<&'a TurnState>,
     session: Option<&'a SessionView>,
     cwd: &'a Path,
-    scroll: u16,
+    scroll_up: usize,
 }
 
 impl<'a> CodexTranscriptWidget<'a> {
@@ -195,7 +200,7 @@ impl<'a> CodexTranscriptWidget<'a> {
             live_turn,
             session: None,
             cwd,
-            scroll: 0,
+            scroll_up: 0,
         }
     }
 
@@ -204,8 +209,11 @@ impl<'a> CodexTranscriptWidget<'a> {
         self
     }
 
-    pub fn with_scroll(mut self, scroll: u16) -> Self {
-        self.scroll = scroll;
+    /// Scrollback offset in wrapped display lines above the bottom-pinned
+    /// position. `0` follows the newest output; larger values reveal older
+    /// history. Values beyond [`Self::max_scroll_up`] are clamped at render.
+    pub fn with_scroll_up(mut self, scroll_up: usize) -> Self {
+        self.scroll_up = scroll_up;
         self
     }
 
@@ -227,14 +235,39 @@ impl<'a> CodexTranscriptWidget<'a> {
         out.extend(render_transcript_lines(&cells, width));
         out
     }
+
+    fn paragraph(&self, width: u16) -> Paragraph<'static> {
+        Paragraph::new(self.lines(width)).wrap(Wrap { trim: false })
+    }
+
+    /// Total wrapped display lines at `width` (post `Paragraph` wrapping, so
+    /// cells that wrap wider than the pane — e.g. the fixed-width live
+    /// markdown tail — are counted at their true on-screen height).
+    pub fn wrapped_line_count(&self, width: u16) -> usize {
+        self.paragraph(width).line_count(width)
+    }
+
+    /// Highest meaningful `scroll_up` offset for `area`: the number of
+    /// wrapped lines hidden above the viewport when pinned to the bottom.
+    /// `0` when the whole transcript fits.
+    pub fn max_scroll_up(&self, area: Rect) -> usize {
+        self.wrapped_line_count(area.width)
+            .saturating_sub(area.height as usize)
+    }
 }
 
 impl<'a> Widget for CodexTranscriptWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let lines = self.lines(area.width);
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((self.scroll, 0))
+        let paragraph = self.paragraph(area.width);
+        // Pin to the bottom: skip everything that would overflow above the
+        // viewport, minus the user's scrollback offset (clamped so the view
+        // never runs past the first line).
+        let max_up = paragraph
+            .line_count(area.width)
+            .saturating_sub(area.height as usize);
+        let top = max_up.saturating_sub(self.scroll_up.min(max_up));
+        paragraph
+            .scroll((top.min(u16::MAX as usize) as u16, 0))
             .render(area, buf);
     }
 }
@@ -498,5 +531,58 @@ mod tests {
         ];
         let cells = views_to_transcript_cells(&views, Path::new("/tmp"));
         assert_eq!(cells.len(), views.len());
+    }
+
+    /// One transcript entry per rendered line — keeps the overflow math in
+    /// the scrollback tests below easy to reason about.
+    fn many_notes(n: usize) -> Vec<TranscriptEntry> {
+        (0..n)
+            .map(|i| TranscriptEntry::Note(format!("note-{i:03}")))
+            .collect()
+    }
+
+    #[test]
+    fn overflowing_transcript_pins_to_newest_output() {
+        // Regression: output taller than the pane used to stay pinned to the
+        // TOP, hiding every new line below the fold with no way to scroll.
+        let entries = many_notes(40);
+        let w = CodexTranscriptWidget::new(&entries, None, Path::new("/tmp"));
+        let out = render_widget(w, 40, 10);
+        assert!(out.contains("note-039"), "newest line visible: {out}");
+        assert!(!out.contains("note-000"), "oldest line scrolled off: {out}");
+    }
+
+    #[test]
+    fn scroll_up_reveals_older_output() {
+        let entries = many_notes(40);
+        let area = Rect::new(0, 0, 40, 10);
+        let max_up =
+            CodexTranscriptWidget::new(&entries, None, Path::new("/tmp")).max_scroll_up(area);
+        assert!(max_up > 0, "fixture must overflow the viewport");
+        let w =
+            CodexTranscriptWidget::new(&entries, None, Path::new("/tmp")).with_scroll_up(max_up);
+        let out = render_widget(w, 40, 10);
+        assert!(out.contains("note-000"), "oldest line visible: {out}");
+        assert!(!out.contains("note-039"), "newest line off-screen: {out}");
+    }
+
+    #[test]
+    fn scroll_up_clamps_past_the_first_line() {
+        let entries = many_notes(40);
+        let w = CodexTranscriptWidget::new(&entries, None, Path::new("/tmp"))
+            .with_scroll_up(usize::MAX);
+        let out = render_widget(w, 40, 10);
+        assert!(out.contains("note-000"), "clamped to first line: {out}");
+    }
+
+    #[test]
+    fn max_scroll_up_is_zero_when_content_fits() {
+        let entries = many_notes(3);
+        let w = CodexTranscriptWidget::new(&entries, None, Path::new("/tmp"));
+        assert_eq!(w.max_scroll_up(Rect::new(0, 0, 40, 10)), 0);
+        // And rendering with any offset still shows everything from the top.
+        let w = CodexTranscriptWidget::new(&entries, None, Path::new("/tmp")).with_scroll_up(5);
+        let out = render_widget(w, 40, 10);
+        assert!(out.contains("note-000") && out.contains("note-002"));
     }
 }

@@ -59,6 +59,68 @@ pub fn compute_layout(area: Rect, state: &AppState) -> [Rect; 2] {
     [chunks[0], chunks[1]]
 }
 
+/// Wheel step for transcript scrollback, matching the ~3-line arrow bursts
+/// terminals emit per notch in "alternate scroll" mode.
+const WHEEL_SCROLL_LINES: isize = 3;
+/// Maximum wheel notches applied from one coalesced input burst. This keeps
+/// high-resolution trackpads from jumping straight to the top/bottom.
+const MAX_WHEEL_BURST_NOTCHES: isize = 4;
+
+/// Scroll the transcript by `delta` wrapped display lines (positive = up,
+/// towards older output). `frame_area` is the full frame; the transcript
+/// rect is derived from the live layout so the clamp matches exactly what
+/// `render_app_ui` draws. The offset saturates at the first line and snaps
+/// back to `0` (follow the newest output) at the bottom. Returns whether the
+/// effective scroll offset changed.
+pub fn scroll_transcript(state: &mut AppState, frame_area: Rect, delta: isize) -> bool {
+    let [transcript, _] = compute_layout(frame_area, state);
+    let max_up = CodexTranscriptWidget::new(
+        &state.transcript,
+        state.current_turn.as_ref(),
+        Path::new(&state.session.cwd),
+    )
+    .with_session(&state.session)
+    .max_scroll_up(transcript);
+    let current = state.transcript_scroll.min(max_up);
+    let next = if delta >= 0 {
+        current.saturating_add(delta as usize).min(max_up)
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    };
+    state.transcript_scroll = next;
+    next != current
+}
+
+/// Transcript scrollback keys: unmodified PageUp/PageDown page through chat
+/// output taller than the window. Handled ahead of the composer (which has
+/// no use for paging in a few-line textarea) and skipped while an overlay
+/// owns the keyboard. Returns `true` when the key was consumed.
+pub fn handle_scroll_key(
+    state: &mut AppState,
+    frame_area: Rect,
+    code: KeyCode,
+    mods: KeyModifiers,
+) -> bool {
+    if state.overlay.is_open() || !mods.is_empty() {
+        return false;
+    }
+    let page = {
+        let [transcript, _] = compute_layout(frame_area, state);
+        (transcript.height.saturating_sub(1).max(1)) as isize
+    };
+    match code {
+        KeyCode::PageUp => {
+            scroll_transcript(state, frame_area, page);
+            true
+        }
+        KeyCode::PageDown => {
+            scroll_transcript(state, frame_area, -page);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Trait abstraction so `draw()` works with both ratatui and Codex `custom_terminal` frames.
 trait RenderFrame {
     fn area(&self) -> Rect;
@@ -112,7 +174,8 @@ fn render_app_ui<F: RenderFrame>(state: &AppState, frame: &mut F) {
             state.current_turn.as_ref(),
             Path::new(&state.session.cwd),
         )
-        .with_session(&state.session),
+        .with_session(&state.session)
+        .with_scroll_up(state.transcript_scroll),
         transcript,
     );
     frame.render_widget(BottomPaneWidget::from_state(state), bottom);
@@ -479,14 +542,48 @@ fn handle_mouse(
                 created: Instant::now(),
             };
         }
-        // Preserve the pre-capture "alternate scroll" behavior where the
-        // wheel produced arrow-key sequences in the alternate screen.
+        // Wheel: scroll the transcript so output taller than the window
+        // stays reachable. Overlays keep the legacy arrow-key mapping so
+        // pickers and lists remain wheel-navigable.
         MouseAction::ScrollUp => {
-            let _ = handle_key(state, client, KeyCode::Up, KeyModifiers::empty());
+            if state.overlay.is_open() {
+                let _ = handle_key(state, client, KeyCode::Up, KeyModifiers::empty());
+            } else {
+                scroll_transcript(state, area, WHEEL_SCROLL_LINES);
+            }
         }
         MouseAction::ScrollDown => {
-            let _ = handle_key(state, client, KeyCode::Down, KeyModifiers::empty());
+            if state.overlay.is_open() {
+                let _ = handle_key(state, client, KeyCode::Down, KeyModifiers::empty());
+            } else {
+                scroll_transcript(state, area, -WHEEL_SCROLL_LINES);
+            }
         }
+    }
+}
+
+fn handle_wheel(
+    state: &mut AppState,
+    client: &SidecarClient,
+    frame_area: Rect,
+    notches: isize,
+) {
+    if notches == 0 {
+        return;
+    }
+    let notches = notches.clamp(-MAX_WHEEL_BURST_NOTCHES, MAX_WHEEL_BURST_NOTCHES);
+    if state.overlay.is_open() {
+        let key = if notches > 0 {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        for _ in 0..notches.unsigned_abs() {
+            let _ = handle_key(state, client, key, KeyModifiers::empty());
+        }
+    } else {
+        let delta = notches.saturating_mul(WHEEL_SCROLL_LINES);
+        let _ = scroll_transcript(state, frame_area, delta);
     }
 }
 
@@ -1087,12 +1184,19 @@ async fn run_interactive_loop(
             evt = tui_rx.recv() => {
                 match evt {
                     Some(TuiEvent::Term(CtEvent::Key(k))) => {
-                        if let KeyOutcome::Quit = handle_key(state, client, k.code, k.modifiers) {
+                        if handle_scroll_key(state, terminal.viewport_area, k.code, k.modifiers) {
+                            // Consumed by transcript scrollback (PageUp/PageDown).
+                        } else if let KeyOutcome::Quit =
+                            handle_key(state, client, k.code, k.modifiers)
+                        {
                             break;
                         }
                     }
                     Some(TuiEvent::Term(CtEvent::Mouse(m))) => {
                         handle_mouse(state, client, terminal, m);
+                    }
+                    Some(TuiEvent::Wheel(notches)) => {
+                        handle_wheel(state, client, terminal.viewport_area, notches);
                     }
                     Some(TuiEvent::Term(CtEvent::Resize(_, _))) => {
                         // Cell coordinates shift on resize; drop any active
@@ -2093,5 +2197,125 @@ mod tests {
         state.selection = Some(crate::app::selection::Selection::new(1, 1));
         handle_key(&mut state, &client, KeyCode::Char('a'), KeyModifiers::empty());
         assert_eq!(None, state.selection, "typing must dismiss the highlight");
+    }
+
+    // --- Transcript scrollback (fix: output taller than the window was
+    //     unreachable — the pane was pinned to the top with no scroll) ---
+
+    fn overflowing_state(lines: usize) -> AppState {
+        let mut state = AppState::new("/tmp".into());
+        for i in 0..lines {
+            state
+                .transcript
+                .push(TranscriptEntry::Note(format!("note-{i:03}")));
+        }
+        state
+    }
+
+    #[test]
+    fn overflowing_transcript_frame_shows_newest_output() {
+        let state = overflowing_state(100);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        draw_to_buffer(&state, &mut terminal).unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(out.contains("note-099"), "newest output visible: {out}");
+        assert!(!out.contains("note-000"), "oldest scrolled off-screen");
+    }
+
+    #[test]
+    fn scroll_transcript_clamps_between_tail_and_first_line() {
+        let mut state = overflowing_state(100);
+        let frame = Rect::new(0, 0, 80, 24);
+        // Scrolling down while already at the tail stays pinned.
+        assert!(!scroll_transcript(&mut state, frame, -10));
+        assert_eq!(state.transcript_scroll, 0);
+        // A huge upward delta clamps at the first line.
+        assert!(scroll_transcript(&mut state, frame, isize::MAX));
+        let max = state.transcript_scroll;
+        assert!(max > 0, "fixture must overflow the transcript pane");
+        assert!(!scroll_transcript(&mut state, frame, 5));
+        assert_eq!(state.transcript_scroll, max, "already at the top");
+        // And scrolling back down eventually re-enters follow mode.
+        assert!(scroll_transcript(&mut state, frame, -(max as isize)));
+        assert_eq!(state.transcript_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn coalesced_wheel_delta_scrolls_once_by_net_notches() {
+        let mut state = overflowing_state(100);
+        let (client, _peer) = SidecarClient::in_memory();
+        let frame = Rect::new(0, 0, 80, 24);
+
+        handle_wheel(&mut state, &client, frame, 12);
+        assert_eq!(
+            state.transcript_scroll,
+            (MAX_WHEEL_BURST_NOTCHES * WHEEL_SCROLL_LINES) as usize
+        );
+
+        handle_wheel(&mut state, &client, frame, -7);
+        assert_eq!(state.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn page_keys_scroll_the_transcript_and_are_consumed() {
+        let mut state = overflowing_state(100);
+        let frame = Rect::new(0, 0, 80, 24);
+        assert!(handle_scroll_key(
+            &mut state,
+            frame,
+            KeyCode::PageUp,
+            KeyModifiers::empty()
+        ));
+        assert!(state.transcript_scroll > 0, "PageUp scrolls into history");
+        let after_up = state.transcript_scroll;
+        assert!(handle_scroll_key(
+            &mut state,
+            frame,
+            KeyCode::PageDown,
+            KeyModifiers::empty()
+        ));
+        assert!(state.transcript_scroll < after_up, "PageDown scrolls back");
+        // Other keys and modified page keys fall through to the composer.
+        assert!(!handle_scroll_key(
+            &mut state,
+            frame,
+            KeyCode::Up,
+            KeyModifiers::empty()
+        ));
+        assert!(!handle_scroll_key(
+            &mut state,
+            frame,
+            KeyCode::PageUp,
+            KeyModifiers::SHIFT
+        ));
+    }
+
+    #[test]
+    fn page_keys_fall_through_while_an_overlay_is_open() {
+        let mut state = overflowing_state(100);
+        state.overlay = Overlay::Help;
+        assert!(!handle_scroll_key(
+            &mut state,
+            Rect::new(0, 0, 80, 24),
+            KeyCode::PageUp,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(state.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn submitting_a_new_turn_jumps_back_to_the_tail() {
+        let mut state = overflowing_state(100);
+        scroll_transcript(&mut state, Rect::new(0, 0, 80, 24), 10);
+        assert!(state.transcript_scroll > 0);
+        state.begin_user_turn("next prompt".into());
+        assert_eq!(state.transcript_scroll, 0, "new turn follows live output");
     }
 }
